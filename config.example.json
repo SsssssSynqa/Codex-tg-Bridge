@@ -27,6 +27,12 @@
   "workdir": "/absolute/path/to/your/codex/workspace",
   "model": "gpt-5.5",
   "reasoningEffort": "medium",
+  "serviceTier": "fast",
+  "privateToolsEnabled": false,
+  "toolWritableRoots": [
+    "/absolute/path/to/your/codex/workspace"
+  ],
+  "toolNetworkAccess": false,
   "timeoutMs": 600000,
   "imageMaxBytes": 10485760,
   "fileMaxBytes": 20971520,

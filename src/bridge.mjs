@@ -29,6 +29,10 @@ const DEFAULT_CONFIG = Object.freeze({
   workdir: process.cwd(),
   model: 'gpt-5.5',
   reasoningEffort: 'medium',
+  serviceTier: 'fast',
+  privateToolsEnabled: false,
+  toolWritableRoots: [],
+  toolNetworkAccess: false,
   timeoutMs: 600000,
   imageMaxBytes: 10 * 1024 * 1024,
   fileMaxBytes: 20 * 1024 * 1024,
@@ -91,6 +95,10 @@ function resolvePath(baseDir, maybePath) {
   return path.isAbsolute(maybePath) ? maybePath : path.resolve(baseDir, maybePath);
 }
 
+function redactSensitiveText(value) {
+  return String(value || '').replace(/\b\d+:[A-Za-z0-9_-]{30,}\b/g, '[telegram-token-redacted]');
+}
+
 function log(message) {
   console.log(`${new Date().toISOString()} ${message}`);
 }
@@ -124,6 +132,10 @@ const allowedGroups = new Map(Object.entries(config.allowedGroups || {}));
 const workdir = resolvePath(bridgeRoot, config.workdir);
 const codexPath = config.codexPath || 'codex';
 const timeoutMs = Number(config.timeoutMs || DEFAULT_CONFIG.timeoutMs);
+const privateToolsEnabled = config.privateToolsEnabled === true;
+const toolWritableRoots = Array.isArray(config.toolWritableRoots) && config.toolWritableRoots.length
+  ? config.toolWritableRoots.map((root) => resolvePath(bridgeRoot, root))
+  : [workdir];
 const stateDir = resolvePath(bridgeRoot, config.stateDir || '.state');
 const imageCacheDir = resolvePath(bridgeRoot, config.imageCacheDir || 'telegram-images');
 const fileCacheDir = resolvePath(bridgeRoot, config.fileCacheDir || 'telegram-files');
@@ -155,12 +167,21 @@ const codex = checkOnly
       threadId: sessionId,
       model: config.model || DEFAULT_CONFIG.model,
       effort: config.reasoningEffort || DEFAULT_CONFIG.reasoningEffort,
+      serviceTier: config.serviceTier || DEFAULT_CONFIG.serviceTier,
       timeoutMs,
+      toolWritableRoots,
+      toolNetworkAccess: config.toolNetworkAccess === true,
       log,
       onReady: (threadId) => {
         sessionId = threadId;
         writePrivateFile(sessionPath, threadId);
         log(`Codex app-server ready; session ${threadId}`);
+      },
+      onSecurityEvent: (event) => {
+        const params = event.params || {};
+        const command = Array.isArray(params.command) ? params.command.join(' ') : params.command;
+        const summary = redactSensitiveText(command || params.reason || params.method || params.grantRoot || '');
+        log(`tool approval ${event.kind} decision=${event.decision}${summary ? ` summary=${summary.slice(0, 240)}` : ''}`);
       },
     });
 
@@ -214,10 +235,15 @@ async function sendMessage(chatId, text, replyToMessageId = null, options = {}) 
 }
 
 function buildPrivatePrompt(text, images = [], files = []) {
+  const toolLine = privateToolsEnabled
+    ? `Private tool mode is enabled. If ${config.ownerName} clearly asks you to inspect or modify local code, files, or service state, you may use Codex tools directly. Writable roots are limited to: ${toolWritableRoots.join(', ')}. Do not run recursive deletion, hard reset, force push, branch deletion, broad permission changes, disk operations, or commands containing secrets/tokens.`
+    : 'Private tool mode is disabled. You may analyze and explain, but you should not attempt to modify local files or execute commands.';
   return [
     `This message came from ${config.ownerName}.`,
     `Reply directly as ${config.botName}. Only output the message body that should be sent in Telegram.`,
     'Do not mention the bridge, CLI, tools, logs, or internal runtime unless the user asks for implementation details.',
+    'Scope rule: this is a private chat. Group-specific promptInstructions from any Telegram group are not active here and must not change the private-chat voice, naming, privacy posture, or style.',
+    toolLine,
     ...(images.length ? [`The message includes ${images.length} image attachment(s), already provided as visual input.`] : []),
     ...(files.length ? [`The message includes ${files.length} regular file attachment(s). Metadata, local paths, and any extractable text previews are included in the [attachments] section. Use the text previews first; if no preview is available, do not pretend to have read the full file body.`] : []),
     '',
@@ -300,6 +326,8 @@ function buildGroupPrompt(text, context, images = [], files = []) {
     `This message came from ${sender}${context.senderUsername ? ` (@${context.senderUsername})` : ''} in Telegram group "${context.chatTitle || 'group'}".`,
     `Reply naturally as ${config.botName}. Only output the message body that should be sent in Telegram.`,
     'Do not confuse the sender with the owner. Do not mention the bridge, CLI, tools, logs, or internal runtime.',
+    'Scope rule: group-specific promptInstructions apply only to this Telegram group and this reply. They must not carry over to private chats or other groups.',
+    'This is a group chat turn. It is always read-only; discuss code and files if useful, but do not attempt local file changes or command execution.',
     ...(images.length ? [`The message includes ${images.length} image attachment(s), already provided as visual input.`] : []),
     ...(files.length ? [`The message includes ${files.length} regular file attachment(s). Metadata, local paths, and any extractable text previews are included in the [attachments] section. Use the text previews first; if no preview is available, do not pretend to have read the full file body.`] : []),
     ...(context.promptInstructions ? [`Group-specific instructions: ${context.promptInstructions}`] : []),
@@ -316,7 +344,11 @@ async function askCodex(text, context, images = [], files = []) {
   const prompt = context.isGroup
     ? buildGroupPrompt(text, context, images, files)
     : buildPrivatePrompt(text, images, files);
-  const result = await codex.ask(prompt, images);
+  const result = await codex.ask(
+    prompt,
+    images,
+    { toolMode: context.isGroup ? 'read-only' : (privateToolsEnabled ? 'private-tools' : 'read-only') },
+  );
   sessionId = result.threadId;
   return result.reply;
 }
@@ -372,6 +404,8 @@ function buildGroupBatchPrompt(batch, { superseding }) {
     'Later messages may supersede earlier temporary state, but do not discard independent questions or important context just because they are older.',
     'Group related topics together. Split into a second reply only when it is genuinely useful. At most two replies; default to one.',
     `Reply as ${config.botName}. Do not mention bridge internals, CLI logs, runtime details, or hidden implementation.`,
+    'Scope rule: group-specific promptInstructions apply only to this Telegram group and this batch. They must not carry over to private chats or other groups.',
+    'This is a group chat batch. It is always read-only; discuss code and files if useful, but do not attempt local file changes or command execution.',
     ...(imageCount ? [`This batch includes ${imageCount} image attachment(s), provided as visual input in message order.`] : []),
     ...(fileCount ? [`This batch includes ${fileCount} regular file attachment(s). Metadata, local paths, and extractable text previews are included in the relevant message text and files fields. Use previews first; if no preview is available, do not pretend to have read the full file body.`] : []),
     ...(groupInstructions ? [`Group-specific instructions: ${groupInstructions}`] : []),
@@ -398,7 +432,7 @@ async function generateGroupReplies(batch, options) {
     await telegram('sendChatAction', { chat_id: chatId, action: 'typing' });
     const images = batch.flatMap((message) => message.images || []);
     const result = await modelQueue.run(
-      () => codex.ask(buildGroupBatchPrompt(batch, options), images),
+      () => codex.ask(buildGroupBatchPrompt(batch, options), images, { toolMode: 'read-only' }),
       0,
     );
     sessionId = result.threadId;
@@ -448,7 +482,25 @@ async function processPrivateMessage(message, text, context, images = [], files 
   if (/^\/status$/i.test(text)) {
     await sendMessage(
       chatId,
-      `${config.botName} bridge online | session: ${sessionId ? 'ready' : 'not created yet'} | groups: ${[...allowedGroups.keys()].length}`,
+      `${config.botName} bridge online | session: ${sessionId || 'not created yet'} | groups: ${[...allowedGroups.keys()].length}`,
+    );
+    return;
+  }
+
+  if (/^\/session$/i.test(text)) {
+    await sendMessage(chatId, `Current Codex thread: ${sessionId || 'not created yet'}`);
+    return;
+  }
+
+  if (/^\/tools$/i.test(text)) {
+    await sendMessage(
+      chatId,
+      [
+        `Private tool mode: ${privateToolsEnabled ? 'enabled' : 'disabled'}`,
+        `Writable roots: ${toolWritableRoots.join(', ')}`,
+        `Network access: ${config.toolNetworkAccess === true ? 'enabled' : 'disabled'}`,
+        'Group chats are always read-only.',
+      ].join('\n'),
     );
     return;
   }
@@ -457,6 +509,15 @@ async function processPrivateMessage(message, text, context, images = [], files 
     if (sessionId) writePrivateFile(previousSessionPath, sessionId);
     sessionId = await modelQueue.run(() => codex.newThread(), 20);
     await sendMessage(chatId, 'A fresh Codex session is ready. The previous session id was preserved locally.');
+    return;
+  }
+
+  const resumeMatch = text.match(/^\/(?:resume|attach)\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i);
+  if (resumeMatch) {
+    const targetThreadId = resumeMatch[1].toLowerCase();
+    if (sessionId && sessionId !== targetThreadId) writePrivateFile(previousSessionPath, sessionId);
+    sessionId = await modelQueue.run(() => codex.resumeThread(targetThreadId), 20);
+    await sendMessage(chatId, `Switched to Codex thread: ${sessionId}`);
     return;
   }
 

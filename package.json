@@ -1,6 +1,6 @@
 {
   "name": "telegram-codex-bridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A zero-dependency Telegram Bot API bridge for a persistent Codex app-server session.",
   "type": "module",
   "repository": {
