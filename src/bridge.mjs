@@ -116,6 +116,22 @@ config.rateLimit = { ...DEFAULT_CONFIG.rateLimit, ...(config.rateLimit || {}) };
 config.batchTiming = { ...DEFAULT_CONFIG.batchTiming, ...(config.batchTiming || {}) };
 config.mentionContext = { ...DEFAULT_CONFIG.mentionContext, ...(config.mentionContext || {}) };
 
+const batchTimingKeys = [
+  'singleMessageMs',
+  'sameSenderIdleMs',
+  'sameSenderMaxMs',
+  'multiSenderIdleMs',
+  'multiSenderMaxMs',
+];
+
+function normalizeBatchTiming(value = {}) {
+  return Object.fromEntries(
+    batchTimingKeys
+      .map((key) => [key, Number(value?.[key])])
+      .filter(([, number]) => Number.isFinite(number) && number >= 0),
+  );
+}
+
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) {
   console.error('Missing TELEGRAM_BOT_TOKEN. Put it in .env or the process environment.');
@@ -129,6 +145,7 @@ if (!allowedUserIds.size) {
 }
 
 const allowedGroups = new Map(Object.entries(config.allowedGroups || {}));
+const globalGroupBatchTiming = normalizeBatchTiming(config.batchTiming || {});
 const workdir = resolvePath(bridgeRoot, config.workdir);
 const codexPath = config.codexPath || 'codex';
 const timeoutMs = Number(config.timeoutMs || DEFAULT_CONFIG.timeoutMs);
@@ -159,6 +176,14 @@ const rateLimiter = new SendRateLimiter({
   stateDir: path.join(stateDir, 'rate-limit'),
   log,
 });
+
+function batchTimingForGroup(chatId) {
+  const groupConfig = allowedGroups.get(String(chatId)) || {};
+  return {
+    ...globalGroupBatchTiming,
+    ...normalizeBatchTiming(groupConfig.batchTiming || {}),
+  };
+}
 const codex = checkOnly
   ? null
   : new CodexAppClient({
@@ -235,19 +260,23 @@ async function sendMessage(chatId, text, replyToMessageId = null, options = {}) 
 }
 
 function buildPrivatePrompt(text, images = [], files = []) {
-  const toolLine = privateToolsEnabled
-    ? `Private tool mode is enabled. If ${config.ownerName} clearly asks you to inspect or modify local code, files, or service state, you may use Codex tools directly. Writable roots are limited to: ${toolWritableRoots.join(', ')}. Do not run recursive deletion, hard reset, force push, branch deletion, broad permission changes, disk operations, or commands containing secrets/tokens.`
-    : 'Private tool mode is disabled. You may analyze and explain, but you should not attempt to modify local files or execute commands.';
+  const payload = {
+    mode: 'TG_PRIVATE',
+    botName: config.botName,
+    ownerName: config.ownerName,
+    images: images.length,
+    files: files.length,
+    toolMode: {
+      enabled: privateToolsEnabled,
+      writableRoots: privateToolsEnabled ? toolWritableRoots : [],
+      networkAccess: privateToolsEnabled && config.toolNetworkAccess === true,
+    },
+    text,
+  };
   return [
-    `This message came from ${config.ownerName}.`,
-    `Reply directly as ${config.botName}. Only output the message body that should be sent in Telegram.`,
-    'Do not mention the bridge, CLI, tools, logs, or internal runtime unless the user asks for implementation details.',
-    'Scope rule: this is a private chat. Group-specific promptInstructions from any Telegram group are not active here and must not change the private-chat voice, naming, privacy posture, or style.',
-    toolLine,
-    ...(images.length ? [`The message includes ${images.length} image attachment(s), already provided as visual input.`] : []),
-    ...(files.length ? [`The message includes ${files.length} regular file attachment(s). Metadata, local paths, and any extractable text previews are included in the [attachments] section. Use the text previews first; if no preview is available, do not pretend to have read the full file body.`] : []),
-    '',
-    `${config.ownerName}: ${text}`,
+    'TG_PRIVATE',
+    'Follow the Telegram bridge protocol from AGENTS.md. Reply with the Telegram message body only.',
+    JSON.stringify(payload),
   ].join('\n');
 }
 
@@ -308,35 +337,27 @@ function rememberGroupMessage(message, options) {
   groupHistories.set(key, history);
 }
 
-function formatRecentContextForPrompt(entries = []) {
-  return entries.map((entry) => JSON.stringify({
-    messageId: entry.messageId,
-    sentAt: new Date(entry.sentAt || Date.now()).toISOString(),
-    sender: entry.sender,
-    username: entry.username,
-    senderIsBot: entry.senderIsBot,
-    text: entry.text,
-  }));
-}
-
 function buildGroupPrompt(text, context, images = [], files = []) {
   const sender = context.senderName || context.senderUsername || 'unknown sender';
-  const recentContext = formatRecentContextForPrompt(context.recentContext || []);
+  const payload = {
+    mode: 'TG_GROUP_MESSAGE',
+    botName: config.botName,
+    ownerName: config.ownerName,
+    chatId: context.chatId,
+    chatTitle: context.chatTitle || 'group',
+    profile: context.groupProfile || null,
+    sender,
+    username: context.senderUsername || null,
+    senderIsBot: context.senderIsBot,
+    images: images.length,
+    files: files.length,
+    recentContext: context.recentContext || [],
+    text,
+  };
   return [
-    `This message came from ${sender}${context.senderUsername ? ` (@${context.senderUsername})` : ''} in Telegram group "${context.chatTitle || 'group'}".`,
-    `Reply naturally as ${config.botName}. Only output the message body that should be sent in Telegram.`,
-    'Do not confuse the sender with the owner. Do not mention the bridge, CLI, tools, logs, or internal runtime.',
-    'Scope rule: group-specific promptInstructions apply only to this Telegram group and this reply. They must not carry over to private chats or other groups.',
-    'This is a group chat turn. It is always read-only; discuss code and files if useful, but do not attempt local file changes or command execution.',
-    ...(images.length ? [`The message includes ${images.length} image attachment(s), already provided as visual input.`] : []),
-    ...(files.length ? [`The message includes ${files.length} regular file attachment(s). Metadata, local paths, and any extractable text previews are included in the [attachments] section. Use the text previews first; if no preview is available, do not pretend to have read the full file body.`] : []),
-    ...(context.promptInstructions ? [`Group-specific instructions: ${context.promptInstructions}`] : []),
-    ...(recentContext.length ? [
-      'Recent read-only context from earlier group messages. Use it only to understand references; answer the latest message, not these older messages:',
-      ...recentContext,
-    ] : []),
-    '',
-    `${sender}: ${text}`,
+    'TG_GROUP_MESSAGE',
+    'Follow the Telegram bridge protocol from AGENTS.md. Reply with the Telegram message body only.',
+    JSON.stringify(payload),
   ].join('\n');
 }
 
@@ -356,12 +377,10 @@ async function askCodex(text, context, images = [], files = []) {
 function buildGroupBatchPrompt(batch, { superseding }) {
   const chatTitle = batch.at(-1)?.chatTitle || 'group';
   const chatId = String(batch.at(-1)?.chatId || '');
-  const groupInstructions = String(
-    allowedGroups.get(chatId)?.promptInstructions || '',
-  ).trim();
+  const groupConfig = allowedGroups.get(chatId) || {};
   const imageCount = batch.reduce((sum, message) => sum + (message.images || []).length, 0);
   const fileCount = batch.reduce((sum, message) => sum + (message.files || []).length, 0);
-  const messages = batch.map((message) => JSON.stringify({
+  const messages = batch.map((message) => ({
     messageId: message.messageId,
     sentAt: new Date(message.sentAt || message.receivedAt).toISOString(),
     sender: message.senderName,
@@ -394,30 +413,24 @@ function buildGroupBatchPrompt(batch, { superseding }) {
       recentContext.push(entry);
     }
   }
-  const recentContextLines = formatRecentContextForPrompt(recentContext);
+  const payload = {
+    mode: 'TG_GROUP_BATCH',
+    botName: config.botName,
+    ownerName: config.ownerName,
+    chatId,
+    chatTitle,
+    profile: groupConfig.profile || null,
+    superseding,
+    imageCount,
+    fileCount,
+    recentContext,
+    messages,
+  };
 
   return [
-    `These are consecutive Telegram messages from group "${chatTitle}".`,
-    superseding
-      ? 'Your previous draft was not sent because newer context arrived. Ignore the old draft and answer this latest full batch.'
-      : 'Read the whole batch before replying.',
-    'Later messages may supersede earlier temporary state, but do not discard independent questions or important context just because they are older.',
-    'Group related topics together. Split into a second reply only when it is genuinely useful. At most two replies; default to one.',
-    `Reply as ${config.botName}. Do not mention bridge internals, CLI logs, runtime details, or hidden implementation.`,
-    'Scope rule: group-specific promptInstructions apply only to this Telegram group and this batch. They must not carry over to private chats or other groups.',
-    'This is a group chat batch. It is always read-only; discuss code and files if useful, but do not attempt local file changes or command execution.',
-    ...(imageCount ? [`This batch includes ${imageCount} image attachment(s), provided as visual input in message order.`] : []),
-    ...(fileCount ? [`This batch includes ${fileCount} regular file attachment(s). Metadata, local paths, and extractable text previews are included in the relevant message text and files fields. Use previews first; if no preview is available, do not pretend to have read the full file body.`] : []),
-    ...(groupInstructions ? [`Group-specific instructions: ${groupInstructions}`] : []),
-    ...(recentContextLines.length ? [
-      'Recent read-only context from before the triggering message(s). Use it to resolve references and pronouns, but do not answer these older messages unless the latest batch explicitly asks about them:',
-      ...recentContextLines,
-    ] : []),
-    'Output strict JSON only, without Markdown fences:',
-    '{"replies":[{"text":"message body for Telegram","replyToMessageId":messageId_or_null}]}',
-    'replyToMessageId must be one of the messageId values below, or null.',
-    '',
-    ...messages,
+    'TG_GROUP_BATCH',
+    'Follow the Telegram bridge protocol from AGENTS.md. Strict JSON only: {"replies":[{"text":"...","replyToMessageId":123|null}]}',
+    JSON.stringify(payload),
   ].join('\n');
 }
 
@@ -452,6 +465,7 @@ async function notifyGroupFailure(chatId, error, batch) {
 }
 
 const groupBatcher = new GroupConversationBatcher({
+  getTiming: batchTimingForGroup,
   generateReplies: generateGroupReplies,
   sendReply: async (chatId, reply, batch, shouldSend) => {
     const fallbackMessageId = [...batch].reverse().find((message) => !message.senderIsBot)?.messageId
@@ -690,7 +704,7 @@ async function handleMessage(message) {
     senderIsBot,
     senderUsername,
     senderName,
-    promptInstructions: groupConfig?.promptInstructions || '',
+    groupProfile: groupConfig?.profile || '',
     recentContext: recentContextForReply,
   };
 

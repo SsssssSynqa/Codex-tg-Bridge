@@ -99,12 +99,14 @@ export class GroupConversationBatcher {
     notifyFailure,
     log = console.log,
     timing = {},
+    getTiming = null,
   }) {
     this.generateReplies = generateReplies;
     this.sendReply = sendReply;
     this.notifyFailure = notifyFailure;
     this.log = log;
     this.timing = { ...DEFAULT_TIMING, ...timing };
+    this.getTiming = typeof getTiming === 'function' ? getTiming : null;
     this.chats = new Map();
   }
 
@@ -123,6 +125,11 @@ export class GroupConversationBatcher {
       });
     }
     return this.chats.get(key);
+  }
+
+  timingFor(chatId, state) {
+    const override = this.getTiming ? this.getTiming(String(chatId), state) : null;
+    return { ...this.timing, ...(override || {}) };
   }
 
   enqueue(message) {
@@ -173,20 +180,21 @@ export class GroupConversationBatcher {
     if (!state.pending.length) return;
 
     const now = Date.now();
+    const timing = this.timingFor(chatId, state);
     const senderCount = new Set(state.pending.map((message) => message.senderId)).size;
     let deadline;
 
     if (state.pending.length === 1) {
-      deadline = state.firstPendingAt + this.timing.singleMessageMs;
+      deadline = state.firstPendingAt + timing.singleMessageMs;
     } else if (senderCount === 1) {
       deadline = Math.min(
-        state.firstPendingAt + this.timing.sameSenderMaxMs,
-        now + this.timing.sameSenderIdleMs,
+        state.firstPendingAt + timing.sameSenderMaxMs,
+        now + timing.sameSenderIdleMs,
       );
     } else {
       deadline = Math.min(
-        state.firstPendingAt + this.timing.multiSenderMaxMs,
-        now + this.timing.multiSenderIdleMs,
+        state.firstPendingAt + timing.multiSenderMaxMs,
+        now + timing.multiSenderIdleMs,
       );
     }
 

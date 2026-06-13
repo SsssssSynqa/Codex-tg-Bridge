@@ -2,7 +2,7 @@
 
 一个零依赖的 Telegram Bot API 桥接器，用来把 Telegram bot 接到持久运行的 `codex app-server` 会话。
 
-它支持私聊、群聊、仅 @ 触发、@ 时读取最近群聊上下文、群聊批量合并回复、bot 接龙防循环、发送限速、Telegram 图片附件、普通文件附件文本预览、可选的私聊工具执行，以及私聊/群聊 prompt 作用域隔离。
+它支持私聊、群聊、仅 @ 触发、@ 时读取最近群聊上下文、群聊批量合并回复、bot 接龙防循环、发送限速、Telegram 图片附件、普通文件附件文本预览、可选的私聊工具执行，以及由 `AGENTS.md` 承载稳定规则的短 Telegram payload 协议。
 
 English documentation: [README.md](README.md).
 
@@ -41,6 +41,8 @@ TELEGRAM_BOT_TOKEN=1234567890:your-real-token
 - 把 `workdir` 改成 Codex 要运行的工作目录。
 - 如果需要群聊，在 `allowedGroups` 里加入群 ID。
 - 在理解安全模型之前，保持 `privateToolsEnabled: false`。
+
+把 `AGENTS.example.md` 里的协议复制到你配置的 `workdir` 对应的 `AGENTS.md`。长人格规则、隐私规则、群 profile 都应该放在那里。不要把长行为 prompt 塞进 `config.json`；桥接器每轮只发送很短的模式标记和动态 Telegram payload。
 
 运行：
 
@@ -93,7 +95,14 @@ npm start
         "messageCount": 10,
         "recordAllDeliveredMessages": true
       },
-      "promptInstructions": "Optional per-group style and privacy rules."
+      "profile": "default-group",
+      "batchTiming": {
+        "singleMessageMs": 3000,
+        "sameSenderIdleMs": 2500,
+        "sameSenderMaxMs": 8000,
+        "multiSenderIdleMs": 4000,
+        "multiSenderMaxMs": 12000
+      }
     }
   },
   "workdir": "/absolute/path/to/your/codex/workspace",
@@ -105,8 +114,8 @@ npm start
 
 重要顶层选项：
 
-- `botName`：写入 prompt 的 bot 名称。
-- `ownerName`：私聊里使用的用户称呼。
+- `botName`：写入短 Telegram payload 的 bot 名称。
+- `ownerName`：写入短 Telegram payload 的私聊用户称呼。
 - `workdir`：Codex 工作目录。
 - `model`：Codex 模型，默认 `gpt-5.5`。
 - `reasoningEffort`：推理强度，默认 `medium`。
@@ -123,7 +132,10 @@ npm start
 - `allowUnaddressedBotMessages`：允许已授权 bot 不 @ 也触发。
 - `maxConsecutiveBotMessages`：限制连续 bot 接龙，防止循环。
 - `mentionContext`：被 @ 或回复时，读取最近群消息作为只读上下文。
-- `promptInstructions`：该群专属行为和隐私规则，会注入 prompt。
+- `profile`：短 profile key，会写入 payload；在 `AGENTS.md` 里用它选择对应群规则。
+- `batchTiming`：可选的单群消息收集窗口覆盖值。高频游戏/闲聊群建议设置更长窗口，减少模型调用。
+
+`promptInstructions` 已不推荐也不会作为长规则注入。群专属行为、语气和隐私规则应该写进 `AGENTS.md`，不要每条消息重复发送。
 
 ## 私聊工具模式
 
@@ -139,12 +151,13 @@ npm start
 
 这仍然是一个远程控制入口。请严格限制 `allowedUserIds`，保护 bot token，不要给共享账号开启工具模式。
 
-## Prompt 作用域隔离
+## Prompt 协议和作用域隔离
 
 桥接默认使用同一个持久 Codex thread，因此私聊和群聊可能共享历史。为了减少风格和隐私规则串味：
 
-- 私聊 prompt 会明确声明：任何群聊专属规则不适用于私聊。
-- 群聊 prompt 会明确声明：群规则只适用于当前群和当前轮/批次。
+- 稳定 Telegram 规则放在工作区 `AGENTS.md`；可以从 `AGENTS.example.md` 开始。
+- 每轮 bridge prompt 都尽量短，只包含 `TG_PRIVATE`、`TG_GROUP_BATCH` 之类的模式标记，以及当前 Telegram 消息的 JSON payload。
+- 群 profile 应写在 `AGENTS.md` 里，并由 `config.json` 里的短 `profile` key 选择。
 - 即使私聊工具模式开启，群聊也始终只读。
 
 如果你需要更强隔离，请为不同场景运行不同桥接实例或使用不同 session。

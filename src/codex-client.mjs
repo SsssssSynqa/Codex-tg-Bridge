@@ -307,7 +307,11 @@ export class CodexAppClient {
           persistExtendedHistory: false,
         });
         this.threadId = resumed.thread.id;
-      } catch {
+      } catch (error) {
+        this.logSecurityEvent('thread-resume-failed', {
+          threadId: this.threadId,
+          error: error?.message || String(error),
+        }, 'start-new-thread');
         await this.startThread();
       }
     } else {

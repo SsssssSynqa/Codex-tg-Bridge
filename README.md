@@ -2,7 +2,7 @@
 
 A small, zero-dependency Telegram Bot API bridge that connects a Telegram bot to a persistent `codex app-server` session.
 
-It supports private chats, group chats, mention-only mode, recent group context, batched group replies, bot-loop limits, outbound rate limiting, image attachments, regular file attachments with text previews, optional private-chat tool execution, and prompt-scope isolation between private chats and public groups.
+It supports private chats, group chats, mention-only mode, recent group context, batched group replies, bot-loop limits, outbound rate limiting, image attachments, regular file attachments with text previews, optional private-chat tool execution, and short Telegram payloads backed by stable `AGENTS.md` instructions.
 
 中文文档见 [README.zh-CN.md](README.zh-CN.md).
 
@@ -41,6 +41,8 @@ Edit `config.json`:
 - Set `workdir` to the folder where Codex should run.
 - Add any group chat IDs under `allowedGroups`.
 - Leave `privateToolsEnabled` as `false` until you understand the tool safety model.
+
+Copy the protocol from `AGENTS.example.md` into the `AGENTS.md` file for your configured `workdir`. Put long persona, privacy, and group-profile rules there. Do not put long behavior prompts in `config.json`; the bridge sends only short mode markers plus dynamic Telegram payloads on each turn.
 
 Then run:
 
@@ -93,7 +95,14 @@ Group IDs usually look like `-1001234567890`.
         "messageCount": 10,
         "recordAllDeliveredMessages": true
       },
-      "promptInstructions": "Optional per-group style and privacy rules."
+      "profile": "default-group",
+      "batchTiming": {
+        "singleMessageMs": 3000,
+        "sameSenderIdleMs": 2500,
+        "sameSenderMaxMs": 8000,
+        "multiSenderIdleMs": 4000,
+        "multiSenderMaxMs": 12000
+      }
     }
   },
   "workdir": "/absolute/path/to/your/codex/workspace",
@@ -105,8 +114,8 @@ Group IDs usually look like `-1001234567890`.
 
 Important top-level options:
 
-- `botName`: name inserted into prompts.
-- `ownerName`: private-chat owner label inserted into prompts.
+- `botName`: bot persona/name included in the short Telegram payload.
+- `ownerName`: private-chat owner label included in the short Telegram payload.
 - `workdir`: working directory for Codex.
 - `model`: Codex model, default `gpt-5.5`.
 - `reasoningEffort`: Codex reasoning effort, default `medium`.
@@ -123,7 +132,10 @@ Important group options:
 - `allowUnaddressedBotMessages`: lets listed bot users trigger without mentioning this bot.
 - `maxConsecutiveBotMessages`: stops accidental bot-to-bot loops.
 - `mentionContext`: when the bot is mentioned or replied to, include recent group messages as read-only context.
-- `promptInstructions`: group-specific behavior and privacy rules inserted into the prompt.
+- `profile`: short key included in the payload so your `AGENTS.md` can select the matching group profile.
+- `batchTiming`: optional per-group overrides for message collection windows. Use longer windows for busy game/social groups to reduce model calls.
+
+`promptInstructions` is intentionally not used. Long group behavior and privacy rules should live in `AGENTS.md`, not in per-message bridge prompts.
 
 ## Private Tool Mode
 
@@ -139,12 +151,13 @@ When private tool mode is enabled:
 
 This is still a remote-control surface. Keep `allowedUserIds` strict, keep your bot token private, and avoid enabling tool mode for shared accounts.
 
-## Prompt-Scope Isolation
+## Prompt Protocol And Scope Isolation
 
 The bridge uses a single persistent Codex thread by default, so private chats and group chats may share history. To reduce style and privacy bleed:
 
-- Private prompts explicitly state that group-specific rules do not apply to private chat.
-- Group prompts explicitly state that group-specific rules apply only to that group and that turn/batch.
+- Stable Telegram rules live in your workspace `AGENTS.md`; start from `AGENTS.example.md`.
+- Per-turn bridge prompts are intentionally small: a mode marker such as `TG_PRIVATE` or `TG_GROUP_BATCH` plus a JSON payload containing the current Telegram message(s).
+- Group profiles should be defined in `AGENTS.md` and selected by the short `profile` key from `config.json`.
 - Group turns are always read-only even when private tool mode is enabled.
 
 If you need stronger isolation, use separate bridge instances or separate sessions for different contexts.

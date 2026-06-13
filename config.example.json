@@ -20,7 +20,14 @@
         "messageCount": 10,
         "recordAllDeliveredMessages": true
       },
-      "promptInstructions": "Optional per-group style and privacy rules."
+      "profile": "default-group",
+      "batchTiming": {
+        "singleMessageMs": 3000,
+        "sameSenderIdleMs": 2500,
+        "sameSenderMaxMs": 8000,
+        "multiSenderIdleMs": 4000,
+        "multiSenderMaxMs": 12000
+      }
     }
   },
   "codexPath": "/usr/local/bin/codex",
