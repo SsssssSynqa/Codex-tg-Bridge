@@ -1,0 +1,33 @@
+{
+  "name": "telegram-codex-bridge",
+  "version": "0.1.0",
+  "description": "A zero-dependency Telegram Bot API bridge for a persistent Codex app-server session.",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SsssssSynqa/Codex-tg-Bridge.git"
+  },
+  "bugs": {
+    "url": "https://github.com/SsssssSynqa/Codex-tg-Bridge/issues"
+  },
+  "homepage": "https://github.com/SsssssSynqa/Codex-tg-Bridge#readme",
+  "bin": {
+    "telegram-codex-bridge": "src/bridge.mjs"
+  },
+  "scripts": {
+    "check": "node --check src/*.mjs",
+    "start": "node src/bridge.mjs --config config.json",
+    "check:config": "node src/bridge.mjs --config config.json --check",
+    "test:prompt": "node src/bridge.mjs --config config.json --test"
+  },
+  "keywords": [
+    "telegram",
+    "codex",
+    "bot",
+    "bridge"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -1,0 +1,10 @@
+.env
+config.json
+*.log
+*.err.log
+offset.txt
+session.txt
+session.previous.txt
+telegram-images/
+node_modules/
+.DS_Store

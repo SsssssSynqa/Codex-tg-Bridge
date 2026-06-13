@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.example.telegram-codex-bridge</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/node</string>
+    <string>/ABSOLUTE/PATH/telegram-codex-bridge/src/bridge.mjs</string>
+    <string>--config</string>
+    <string>/ABSOLUTE/PATH/telegram-codex-bridge/config.json</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/ABSOLUTE/PATH/telegram-codex-bridge</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/YOUR_USER</string>
+    <key>PATH</key>
+    <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>TELEGRAM_BOT_TOKEN</key>
+    <string>PUT_TOKEN_HERE_OR_USE_A_WRAPPER_SCRIPT</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/ABSOLUTE/PATH/telegram-codex-bridge/bridge.log</string>
+  <key>StandardErrorPath</key>
+  <string>/ABSOLUTE/PATH/telegram-codex-bridge/bridge.err.log</string>
+</dict>
+</plist>

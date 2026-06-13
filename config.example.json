@@ -1,0 +1,50 @@
+{
+  "botName": "Codex",
+  "ownerName": "you",
+  "allowedUserIds": [
+    "123456789"
+  ],
+  "allowedGroups": {
+    "-1001234567890": {
+      "title": "Example group",
+      "requireMention": true,
+      "allowAllHumanUsers": false,
+      "allowAllBotUsers": false,
+      "allowUnaddressedBotMessages": false,
+      "allowedUserIds": [
+        "123456789"
+      ],
+      "maxConsecutiveBotMessages": 4,
+      "mentionContext": {
+        "enabled": true,
+        "messageCount": 10,
+        "recordAllDeliveredMessages": true
+      },
+      "promptInstructions": "Optional per-group style and privacy rules."
+    }
+  },
+  "codexPath": "/usr/local/bin/codex",
+  "workdir": "/absolute/path/to/your/codex/workspace",
+  "model": "gpt-5.5",
+  "reasoningEffort": "medium",
+  "timeoutMs": 600000,
+  "imageMaxBytes": 10485760,
+  "mentionContext": {
+    "enabled": true,
+    "messageCount": 10,
+    "maxStoredMessages": 50,
+    "maxMessageChars": 800,
+    "recordAllDeliveredMessages": true
+  },
+  "rateLimit": {
+    "enabled": true,
+    "minIntervalMs": 10000
+  },
+  "batchTiming": {
+    "singleMessageMs": 1000,
+    "sameSenderIdleMs": 1800,
+    "sameSenderMaxMs": 3000,
+    "multiSenderIdleMs": 2200,
+    "multiSenderMaxMs": 5000
+  }
+}
