@@ -16,6 +16,7 @@
   },
   "scripts": {
     "check": "node --check src/*.mjs",
+    "test": "node --test test/*.test.mjs",
     "start": "node src/bridge.mjs --config config.json",
     "check:config": "node src/bridge.mjs --config config.json --check",
     "test:prompt": "node src/bridge.mjs --config config.json --test"

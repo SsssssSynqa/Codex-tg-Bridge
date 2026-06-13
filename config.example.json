@@ -29,6 +29,8 @@
   "reasoningEffort": "medium",
   "timeoutMs": 600000,
   "imageMaxBytes": 10485760,
+  "fileMaxBytes": 20971520,
+  "attachmentTextMaxChars": 12000,
   "mentionContext": {
     "enabled": true,
     "messageCount": 10,

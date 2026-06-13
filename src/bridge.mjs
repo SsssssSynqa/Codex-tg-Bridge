@@ -13,11 +13,11 @@ import {
 } from './group-batcher.mjs';
 import { SendRateLimiter } from './rate-limit.mjs';
 import {
-  buildMessageTextWithImages,
-  downloadTelegramImages,
+  buildMessageTextWithAttachments,
+  downloadTelegramAttachments,
   getTelegramMessageEntities,
   getTelegramMessageText,
-  hasTelegramImages,
+  hasTelegramAttachments,
 } from './telegram-image-utils.mjs';
 
 const DEFAULT_CONFIG = Object.freeze({
@@ -31,6 +31,8 @@ const DEFAULT_CONFIG = Object.freeze({
   reasoningEffort: 'medium',
   timeoutMs: 600000,
   imageMaxBytes: 10 * 1024 * 1024,
+  fileMaxBytes: 20 * 1024 * 1024,
+  attachmentTextMaxChars: 12000,
   mentionContext: {
     enabled: true,
     messageCount: 10,
@@ -124,6 +126,7 @@ const codexPath = config.codexPath || 'codex';
 const timeoutMs = Number(config.timeoutMs || DEFAULT_CONFIG.timeoutMs);
 const stateDir = resolvePath(bridgeRoot, config.stateDir || '.state');
 const imageCacheDir = resolvePath(bridgeRoot, config.imageCacheDir || 'telegram-images');
+const fileCacheDir = resolvePath(bridgeRoot, config.fileCacheDir || 'telegram-files');
 fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
 
 const sessionPath = path.join(stateDir, 'session.txt');
@@ -210,12 +213,13 @@ async function sendMessage(chatId, text, replyToMessageId = null, options = {}) 
   return true;
 }
 
-function buildPrivatePrompt(text, images = []) {
+function buildPrivatePrompt(text, images = [], files = []) {
   return [
     `This message came from ${config.ownerName}.`,
     `Reply directly as ${config.botName}. Only output the message body that should be sent in Telegram.`,
     'Do not mention the bridge, CLI, tools, logs, or internal runtime unless the user asks for implementation details.',
     ...(images.length ? [`The message includes ${images.length} image attachment(s), already provided as visual input.`] : []),
+    ...(files.length ? [`The message includes ${files.length} regular file attachment(s). Metadata, local paths, and any extractable text previews are included in the [attachments] section. Use the text previews first; if no preview is available, do not pretend to have read the full file body.`] : []),
     '',
     `${config.ownerName}: ${text}`,
   ].join('\n');
@@ -239,10 +243,10 @@ function truncateText(text, maxChars) {
   return `${value.slice(0, Math.max(0, maxChars - 1)).trimEnd()}...`;
 }
 
-function passiveHistoryText(rawText, messageHasImages, options) {
+function passiveHistoryText(rawText, messageHasAttachments, options) {
   const text = truncateText(rawText, numberOption(options.maxMessageChars, 800, 80));
-  if (text) return messageHasImages ? `${text} [sent image attachment(s)]` : text;
-  return messageHasImages ? '[sent image attachment(s)]' : '';
+  if (text) return messageHasAttachments ? `${text} [sent attachment(s)]` : text;
+  return messageHasAttachments ? '[sent attachment(s)]' : '';
 }
 
 function recentGroupContext(chatId, options) {
@@ -289,7 +293,7 @@ function formatRecentContextForPrompt(entries = []) {
   }));
 }
 
-function buildGroupPrompt(text, context, images = []) {
+function buildGroupPrompt(text, context, images = [], files = []) {
   const sender = context.senderName || context.senderUsername || 'unknown sender';
   const recentContext = formatRecentContextForPrompt(context.recentContext || []);
   return [
@@ -297,6 +301,7 @@ function buildGroupPrompt(text, context, images = []) {
     `Reply naturally as ${config.botName}. Only output the message body that should be sent in Telegram.`,
     'Do not confuse the sender with the owner. Do not mention the bridge, CLI, tools, logs, or internal runtime.',
     ...(images.length ? [`The message includes ${images.length} image attachment(s), already provided as visual input.`] : []),
+    ...(files.length ? [`The message includes ${files.length} regular file attachment(s). Metadata, local paths, and any extractable text previews are included in the [attachments] section. Use the text previews first; if no preview is available, do not pretend to have read the full file body.`] : []),
     ...(context.promptInstructions ? [`Group-specific instructions: ${context.promptInstructions}`] : []),
     ...(recentContext.length ? [
       'Recent read-only context from earlier group messages. Use it only to understand references; answer the latest message, not these older messages:',
@@ -307,10 +312,10 @@ function buildGroupPrompt(text, context, images = []) {
   ].join('\n');
 }
 
-async function askCodex(text, context, images = []) {
+async function askCodex(text, context, images = [], files = []) {
   const prompt = context.isGroup
-    ? buildGroupPrompt(text, context, images)
-    : buildPrivatePrompt(text, images);
+    ? buildGroupPrompt(text, context, images, files)
+    : buildPrivatePrompt(text, images, files);
   const result = await codex.ask(prompt, images);
   sessionId = result.threadId;
   return result.reply;
@@ -323,6 +328,7 @@ function buildGroupBatchPrompt(batch, { superseding }) {
     allowedGroups.get(chatId)?.promptInstructions || '',
   ).trim();
   const imageCount = batch.reduce((sum, message) => sum + (message.images || []).length, 0);
+  const fileCount = batch.reduce((sum, message) => sum + (message.files || []).length, 0);
   const messages = batch.map((message) => JSON.stringify({
     messageId: message.messageId,
     sentAt: new Date(message.sentAt || message.receivedAt).toISOString(),
@@ -335,6 +341,14 @@ function buildGroupBatchPrompt(batch, { superseding }) {
       width: image.width,
       height: image.height,
       fileSize: image.fileSize,
+    })),
+    files: (message.files || []).map((file) => ({
+      fileName: file.fileName,
+      mimeType: file.mimeType,
+      fileSize: file.fileSize,
+      source: file.source,
+      path: file.path,
+      textPreviewStatus: file.textPreviewStatus,
     })),
   }));
   const currentMessageIds = new Set(batch.map((message) => Number(message.messageId)));
@@ -359,6 +373,7 @@ function buildGroupBatchPrompt(batch, { superseding }) {
     'Group related topics together. Split into a second reply only when it is genuinely useful. At most two replies; default to one.',
     `Reply as ${config.botName}. Do not mention bridge internals, CLI logs, runtime details, or hidden implementation.`,
     ...(imageCount ? [`This batch includes ${imageCount} image attachment(s), provided as visual input in message order.`] : []),
+    ...(fileCount ? [`This batch includes ${fileCount} regular file attachment(s). Metadata, local paths, and extractable text previews are included in the relevant message text and files fields. Use previews first; if no preview is available, do not pretend to have read the full file body.`] : []),
     ...(groupInstructions ? [`Group-specific instructions: ${groupInstructions}`] : []),
     ...(recentContextLines.length ? [
       'Recent read-only context from before the triggering message(s). Use it to resolve references and pronouns, but do not answer these older messages unless the latest batch explicitly asks about them:',
@@ -420,7 +435,7 @@ const groupBatcher = new GroupConversationBatcher({
   timing: config.batchTiming,
 });
 
-async function processPrivateMessage(message, text, context, images = []) {
+async function processPrivateMessage(message, text, context, images = [], files = []) {
   const chatId = String(message.chat.id);
   const fromId = String(message.from.id);
   log(`authorized private message chat=${chatId} from=${fromId}`);
@@ -453,7 +468,7 @@ async function processPrivateMessage(message, text, context, images = []) {
   try {
     const startedAt = Date.now();
     await telegram('sendChatAction', { chat_id: chatId, action: 'typing' });
-    const reply = await modelQueue.run(() => askCodex(text, context, images), 10);
+    const reply = await modelQueue.run(() => askCodex(text, context, images, files), 10);
     await sendMessage(chatId, reply);
     log(`private reply sent chat=${chatId} from=${fromId} elapsed_ms=${Date.now() - startedAt}`);
   } catch (error) {
@@ -466,8 +481,8 @@ async function processPrivateMessage(message, text, context, images = []) {
 
 async function handleMessage(message) {
   const rawText = getTelegramMessageText(message);
-  const messageHasImages = hasTelegramImages(message);
-  if (!message || (!rawText && !messageHasImages)) return;
+  const messageHasAttachments = hasTelegramAttachments(message);
+  if (!message || (!rawText && !messageHasAttachments)) return;
 
   const fromId = String(message.from?.id || '');
   const chatId = String(message.chat?.id || '');
@@ -510,7 +525,7 @@ async function handleMessage(message) {
       rememberGroupMessage({
         chatId,
         messageId: message.message_id,
-        text: passiveHistoryText(rawText, messageHasImages, groupMentionContext),
+        text: passiveHistoryText(rawText, messageHasAttachments, groupMentionContext),
         senderIsBot,
         senderUsername,
         senderName,
@@ -582,19 +597,22 @@ async function handleMessage(message) {
     ? new RegExp(`@${botUsername.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'gi')
     : null;
   const captionOrText = (mentionPattern ? rawText.replace(mentionPattern, '') : rawText).trim();
-  const { images, notes: imageNotes } = await downloadTelegramImages(message, {
+  const { images, files, notes: attachmentNotes } = await downloadTelegramAttachments(message, {
     token,
-    cacheDir: imageCacheDir,
+    imageCacheDir,
+    fileCacheDir,
     log,
     maxImageBytes: Number(config.imageMaxBytes || DEFAULT_CONFIG.imageMaxBytes),
+    maxFileBytes: Number(config.fileMaxBytes || DEFAULT_CONFIG.fileMaxBytes),
+    maxPreviewChars: Number(config.attachmentTextMaxChars || DEFAULT_CONFIG.attachmentTextMaxChars),
   });
-  const text = buildMessageTextWithImages(captionOrText, images, imageNotes);
-  if (!text && !images.length) {
+  const text = buildMessageTextWithAttachments(captionOrText, images, files, attachmentNotes);
+  if (!text && !images.length && !files.length) {
     if (isGroup && shouldRememberCurrentGroupMessage) {
       rememberGroupMessage({
         chatId,
         messageId: message.message_id,
-        text: passiveHistoryText(rawText, messageHasImages, groupMentionContext),
+        text: passiveHistoryText(rawText, messageHasAttachments, groupMentionContext),
         senderIsBot,
         senderUsername,
         senderName,
@@ -616,7 +634,7 @@ async function handleMessage(message) {
   };
 
   if (isPrivate) {
-    await processPrivateMessage(message, text, context, images);
+    await processPrivateMessage(message, text, context, images, files);
     return;
   }
 
@@ -639,6 +657,7 @@ async function handleMessage(message) {
     messageId: message.message_id,
     text,
     images,
+    files,
     senderId: fromId,
     senderIsBot,
     senderUsername,

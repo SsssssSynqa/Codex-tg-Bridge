@@ -6,5 +6,6 @@ offset.txt
 session.txt
 session.previous.txt
 telegram-images/
+telegram-files/
 node_modules/
 .DS_Store

@@ -2,7 +2,7 @@
 
 A small, zero-dependency Telegram Bot API bridge that connects a Telegram bot to a persistent `codex app-server` session.
 
-It supports private chats, group chats, mention-only mode, recent context on mentions, batched group replies, loop limits for bot-to-bot conversations, outbound rate limiting, and Telegram image attachments.
+It supports private chats, group chats, mention-only mode, recent context on mentions, batched group replies, loop limits for bot-to-bot conversations, outbound rate limiting, Telegram image attachments, and regular Telegram file attachments with text previews.
 
 ## What This Is
 
@@ -111,15 +111,25 @@ Privacy-related options:
 - `mentionContext.maxMessageChars`: maximum text stored per message.
 - `mentionContext.recordAllDeliveredMessages`: when `true`, remember delivered messages from all members in an allowed group, even if they cannot trigger replies.
 
-## Images
+## Attachments
 
 Telegram `photo` messages and image documents are downloaded into `telegram-images/` and passed to Codex as `localImage` inputs.
 
-Image files are ignored by git. By default, images larger than 10 MB are skipped.
+Regular Telegram files are downloaded into `telegram-files/`. The bridge includes file metadata, the local path, and any extractable text preview in the prompt.
+
+Text previews are extracted directly for common text/code/data files such as `.txt`, `.md`, `.json`, `.csv`, `.html`, `.js`, `.ts`, `.py`, `.yaml`, and similar formats. On macOS, `.doc`, `.docx`, `.rtf`, and `.odt` use `textutil` when available. Unsupported binary files are still downloaded, but the bridge only includes metadata and the local path; Codex is instructed not to pretend it has read the full file body when no preview is available.
+
+Attachment caches are ignored by git. By default, images larger than 10 MB and regular files larger than 20 MB are skipped.
+
+Relevant options:
+
+- `imageMaxBytes`: maximum image attachment size.
+- `fileMaxBytes`: maximum regular file attachment size.
+- `attachmentTextMaxChars`: maximum text preview characters per file.
 
 ## Safety Notes
 
-- Never commit `.env`, `config.json`, session files, offsets, logs, or downloaded images.
+- Never commit `.env`, `config.json`, session files, offsets, logs, downloaded images, or downloaded files.
 - If you ever paste a bot token into a chat or issue tracker, rotate it in BotFather.
 - Group-wide `allowAllBotUsers` can create loops. Use it only temporarily or with strict `maxConsecutiveBotMessages`.
 - The bridge runs Codex with `approvalPolicy: "never"` and `sandbox: "read-only"` by default.
@@ -149,6 +159,7 @@ launchctl print gui/$(id -u)/com.example.telegram-codex-bridge
 - Bot ignores a group: add the group ID to `allowedGroups`.
 - Bot replies too often: turn on `requireMention` or lower `maxConsecutiveBotMessages`.
 - Images are ignored: make sure Telegram sends them as `photo` or image documents under `imageMaxBytes`.
+- Files are ignored: make sure they are under `fileMaxBytes`; if a file has no text preview, check whether its format is binary or unsupported.
 
 ## License
 
