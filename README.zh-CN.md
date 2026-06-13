@@ -8,7 +8,7 @@ English documentation: [README.md](README.md).
 
 ## 这是什么
 
-这是一个脱敏后的公共版本。仓库不包含私人 bot token、chat ID、日志、session ID、下载文件或私人 prompt 内容。
+Telegram Codex Bridge 可以把 Telegram bot 作为一个轻量入口，连接到持续运行的 Codex 会话。它适合个人自动化、小范围可信群聊，以及需要从 Telegram 调用 Codex 的 bot-to-bot 工作流。
 
 ## 运行要求
 

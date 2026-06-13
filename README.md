@@ -8,7 +8,7 @@ It supports private chats, group chats, mention-only mode, recent group context,
 
 ## What This Is
 
-This project is a sanitized public version of a local Telegram-to-Codex bridge. It contains no private bot token, chat ID, logs, session IDs, downloaded files, or personal prompt content.
+Telegram Codex Bridge lets you run a Telegram bot as a lightweight front end for a persistent Codex session. It is designed for personal automation, small trusted groups, and bot-to-bot workflows where you want Codex available from Telegram.
 
 ## Requirements
 
