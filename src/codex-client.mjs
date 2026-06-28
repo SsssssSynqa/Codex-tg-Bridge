@@ -332,6 +332,9 @@ export class CodexAppClient {
       ephemeral: false,
       experimentalRawEvents: false,
       persistExtendedHistory: false,
+      // serviceName tags the thread in Codex metadata so it is easy to spot
+      // in `codex thread list` output and in the Codex Desktop sidebar.
+      serviceName: 'codex-telegram',
     });
     this.threadId = started.thread.id;
     return this.threadId;

@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd plist template for the Codex daemon used by codexMode="daemon".
+
+  Replace YOUR_USERNAME with your macOS short username and adjust the
+  WorkingDirectory if you want the daemon to start in a particular
+  workspace.  The default unix socket path lives under $CODEX_HOME (which
+  is ~/.codex unless overridden).  Mode 0600, single-user only.
+
+  Install:
+      cp launchd/com.example.codex-daemon.plist \
+         ~/Library/LaunchAgents/com.example.codex-daemon.plist
+      launchctl bootstrap gui/$(id -u) \
+         ~/Library/LaunchAgents/com.example.codex-daemon.plist
+
+  Verify:
+      launchctl list | grep com.example.codex-daemon
+      ls -la ~/.codex/app-server-control/app-server-control.sock
+
+  Then point the bridge at it via config.json:
+      "codexMode": "daemon"
+
+  And/or attach a TUI:
+      codex --remote unix:///Users/YOUR_USERNAME/.codex/app-server-control/app-server-control.sock
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.example.codex-daemon</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/codex</string>
+        <string>app-server</string>
+        <string>--listen</string>
+        <string>unix:///Users/YOUR_USERNAME/.codex/app-server-control/app-server-control.sock</string>
+        <string>-c</string>
+        <string>analytics.enabled=false</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/YOUR_USERNAME</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>/Users/YOUR_USERNAME</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>StandardOutPath</key>
+    <string>/Users/YOUR_USERNAME/.codex/app-server-control/daemon.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOUR_USERNAME/.codex/app-server-control/daemon.err.log</string>
+</dict>
+</plist>

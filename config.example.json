@@ -31,6 +31,8 @@
     }
   },
   "codexPath": "/usr/local/bin/codex",
+  "codexMode": "spawn",
+  "daemonSocketPath": "",
   "workdir": "/absolute/path/to/your/codex/workspace",
   "model": "gpt-5.5",
   "reasoningEffort": "medium",

@@ -209,6 +209,79 @@ launchctl kickstart -k gui/$(id -u)/com.example.telegram-codex-bridge
 launchctl print gui/$(id -u)/com.example.telegram-codex-bridge
 ```
 
+## Daemon 模式（多客户端共享）
+
+默认情况下 bridge 以 `codexMode: "spawn"` 运行，会为每个 bridge 进程
+启动一个独立的 `codex app-server --stdio` 子进程。这个子进程持有的
+in-memory thread state 是隔离的——如果你同时还开着 Codex.app 或在
+另一个终端跑 `codex --remote`，它们各自都有自己的 Codex 实例，即使
+读同一个磁盘 rollout 文件，在内存里的对话上下文也是分开的。
+
+`codexMode: "daemon"` 把 bridge 切换到共享 daemon 模式。bridge 成为
+连接到一个长跑 `codex app-server --listen unix://PATH` 的多个客户端
+之一，所有 `thread/resume` 同一 thread id 的客户端共享同一份 in-memory
+thread state，daemon 会把事件（token 用量、agentMessage delta、turn
+完成等）广播给所有订阅的客户端。
+
+具体来说就是：Telegram bot 和 `codex --remote` TUI 可以同时 attach
+同一个 thread，实时看到彼此的输入和回复。
+
+### 启用步骤
+
+1. 安装 daemon LaunchAgent（先把 `YOUR_USERNAME` 改成你的用户名）：
+
+   ```bash
+   cp launchd/com.example.codex-daemon.plist ~/Library/LaunchAgents/
+   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.codex-daemon.plist
+   ```
+
+2. 验证 daemon 起来 + socket 是 0600：
+
+   ```bash
+   launchctl list | grep com.example.codex-daemon
+   ls -la ~/.codex/app-server-control/app-server-control.sock
+   ```
+
+3. 切换 bridge config 到 daemon 模式：
+
+   ```json
+   {
+     "codexMode": "daemon",
+     "daemonSocketPath": ""
+   }
+   ```
+
+   `daemonSocketPath` 留空时使用默认路径
+   `$CODEX_HOME/app-server-control/app-server-control.sock`，
+   或者填绝对路径覆盖。改完重启 bridge 让新模式生效。
+
+4. （可选但推荐）打开一个 TUI 作为 peer client：
+
+   ```bash
+   codex --remote unix:///Users/YOUR_USERNAME/.codex/app-server-control/app-server-control.sock
+   ```
+
+   在 TUI 里 list/resume bridge 那个 thread（按 `serviceName:
+   "codex-telegram"` 找，thread id 也写在 `.state/session.txt`）。
+   从此 Telegram 那头发的消息和 TUI 这头打的字都进同一个 Codex 实例。
+
+### 取舍
+
+- daemon 在 Codex 上游标记为 `experimental`。建议固定 codex 版本，
+  升级后再验证一次。
+- 默认的 unix socket 是 mode 0600 单用户，不会暴露给其他用户。除非
+  你同时配置了 `--ws-auth`，否则不要把 daemon 改成
+  `ws://0.0.0.0:PORT`。
+- approval 流量仍然经过 `codex-daemon-client.mjs` 里的 handler。
+  Private-tools turn 用 `on-request` + 跟 spawn 模式一致的可写根
+  目录 / 危险命令 / token 泄露三层防线。read-only 和群聊 turn 用
+  `approvalPolicy: "never"`。
+- `pgrep -P $(launchctl list | awk '/telegram-codex-bridge$/{print $1}')`
+  返回空是 daemon 模式真正生效的直观信号——spawn 模式下 bridge
+  会有一个 `codex app-server` 子进程。
+- 回滚只需一行：把 config 里 `codexMode` 改回 `"spawn"` 再重启
+  bridge。daemon LaunchAgent 可独立用 `launchctl bootout` 停掉。
+
 ## 安全注意事项
 
 - 不要提交 `.env`、`config.json`、session 文件、offset、日志、下载图片或下载文件。

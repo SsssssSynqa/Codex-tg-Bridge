@@ -3,7 +3,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import os from 'node:os';
 import { CodexAppClient } from './codex-client.mjs';
+import { CodexDaemonClient } from './codex-daemon-client.mjs';
 import {
   GroupConversationBatcher,
   PriorityTaskQueue,
@@ -26,6 +28,8 @@ const DEFAULT_CONFIG = Object.freeze({
   allowedUserIds: [],
   allowedGroups: {},
   codexPath: '/usr/local/bin/codex',
+  codexMode: 'spawn',
+  daemonSocketPath: '',
   workdir: process.cwd(),
   model: 'gpt-5.5',
   reasoningEffort: 'medium',
@@ -184,31 +188,75 @@ function batchTimingForGroup(chatId) {
     ...normalizeBatchTiming(groupConfig.batchTiming || {}),
   };
 }
-const codex = checkOnly
-  ? null
-  : new CodexAppClient({
-      codexPath,
-      workdir,
-      threadId: sessionId,
-      model: config.model || DEFAULT_CONFIG.model,
-      effort: config.reasoningEffort || DEFAULT_CONFIG.reasoningEffort,
-      serviceTier: config.serviceTier || DEFAULT_CONFIG.serviceTier,
-      timeoutMs,
-      toolWritableRoots,
-      toolNetworkAccess: config.toolNetworkAccess === true,
-      log,
-      onReady: (threadId) => {
-        sessionId = threadId;
-        writePrivateFile(sessionPath, threadId);
-        log(`Codex app-server ready; session ${threadId}`);
-      },
-      onSecurityEvent: (event) => {
-        const params = event.params || {};
-        const command = Array.isArray(params.command) ? params.command.join(' ') : params.command;
-        const summary = redactSensitiveText(command || params.reason || params.method || params.grantRoot || '');
-        log(`tool approval ${event.kind} decision=${event.decision}${summary ? ` summary=${summary.slice(0, 240)}` : ''}`);
-      },
-    });
+// codexMode: 'spawn' (v1, default, backward compatible) spawns a `codex
+// app-server --stdio` child per bridge process. State is per-process — if
+// you also open Codex.app or `codex --remote` on the same machine they will
+// each have their own isolated in-memory thread state.
+//
+// codexMode: 'daemon' (v2) connects to a long-running `codex app-server
+// --listen unix://PATH` daemon (managed e.g. by a launchd plist). The same
+// thread can then be attached by the bridge AND a `codex --remote unix://PATH`
+// TUI session at the same time, with the daemon broadcasting events to all
+// subscribers. Set `daemonSocketPath` (defaults to
+// $CODEX_HOME/app-server-control/app-server-control.sock) to override.
+const codexMode = config.codexMode === 'daemon' ? 'daemon' : 'spawn';
+const defaultDaemonSocket = path.join(
+  process.env.CODEX_HOME || path.join(os.homedir(), '.codex'),
+  'app-server-control/app-server-control.sock',
+);
+const daemonSocketPath = config.daemonSocketPath
+  ? resolvePath(bridgeRoot, config.daemonSocketPath)
+  : defaultDaemonSocket;
+
+function makeCodexClient() {
+  const sharedOpts = {
+    workdir,
+    threadId: sessionId,
+    model: config.model || DEFAULT_CONFIG.model,
+    effort: config.reasoningEffort || DEFAULT_CONFIG.reasoningEffort,
+    serviceTier: config.serviceTier || DEFAULT_CONFIG.serviceTier,
+    timeoutMs,
+    toolWritableRoots,
+    toolNetworkAccess: config.toolNetworkAccess === true,
+    log,
+    onReady: (threadId) => {
+      // If the underlying client fell back from thread/resume to thread/start
+      // (e.g. the rollout for the previous thread was missing on disk), save
+      // the old session id so /resume can still recover it later.
+      if (sessionId && sessionId !== threadId) {
+        log(`Codex thread switched: old ${sessionId} -> new ${threadId} (saving old to session.previous.txt)`);
+        writePrivateFile(previousSessionPath, sessionId);
+      }
+      sessionId = threadId;
+      writePrivateFile(sessionPath, threadId);
+      log(`Codex ${codexMode} ready; session ${threadId}`);
+    },
+    onThreadChange: (info) => {
+      // daemon-client emits this immediately before swapping thread ids on a
+      // resume failure, so the bridge can preserve the previous id even if
+      // the eventual onReady call doesn't run for any reason.
+      if (info?.previousThreadId) {
+        log(`Codex thread fallback (reason=${info.reason}); saving previous thread ${info.previousThreadId}`);
+        writePrivateFile(previousSessionPath, info.previousThreadId);
+      }
+    },
+    onSecurityEvent: (event) => {
+      const params = event.params || {};
+      const command = Array.isArray(params.command) ? params.command.join(' ') : params.command;
+      const summary = redactSensitiveText(command || params.reason || params.method || params.grantRoot || '');
+      log(`tool approval ${event.kind} decision=${event.decision}${summary ? ` summary=${summary.slice(0, 240)}` : ''}`);
+    },
+  };
+
+  if (codexMode === 'daemon') {
+    log(`Codex mode: daemon (socket=${daemonSocketPath})`);
+    return new CodexDaemonClient({ ...sharedOpts, socketPath: daemonSocketPath });
+  }
+  log(`Codex mode: spawn (codexPath=${codexPath})`);
+  return new CodexAppClient({ ...sharedOpts, codexPath });
+}
+
+const codex = checkOnly ? null : makeCodexClient();
 
 async function telegram(method, params = {}) {
   const response = await fetch(`${telegramApi}/${method}`, {

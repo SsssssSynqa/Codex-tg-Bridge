@@ -209,6 +209,86 @@ Check status:
 launchctl print gui/$(id -u)/com.example.telegram-codex-bridge
 ```
 
+## Daemon Mode (Multi-Client)
+
+By default the bridge runs in `codexMode: "spawn"`, which starts its own
+`codex app-server --stdio` child process per bridge. That child holds an
+isolated in-memory thread state — if you also keep Codex.app open or run
+`codex --remote` in a terminal, they will each have their own Codex
+instance with diverged context, even when they read the same rollout file
+on disk.
+
+`codexMode: "daemon"` switches the bridge to a single shared daemon. The
+bridge becomes one of several clients connected over a local unix socket
+to a long-running `codex app-server --listen unix://PATH`. All clients
+that `thread/resume` the same thread id share one in-memory thread state,
+and the daemon broadcasts events (token usage updates, agent message
+deltas, completion notifications) to every subscribed client.
+
+Concretely this means the Telegram bot and a `codex --remote` TUI can
+both stay attached to the same thread and see each other's turns in
+realtime.
+
+### Enable
+
+1. Install the daemon LaunchAgent (replace `YOUR_USERNAME` first):
+
+   ```bash
+   cp launchd/com.example.codex-daemon.plist ~/Library/LaunchAgents/
+   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.codex-daemon.plist
+   ```
+
+2. Verify the daemon is up and the socket is created with mode 0600:
+
+   ```bash
+   launchctl list | grep com.example.codex-daemon
+   ls -la ~/.codex/app-server-control/app-server-control.sock
+   ```
+
+3. Switch the bridge config to daemon mode:
+
+   ```json
+   {
+     "codexMode": "daemon",
+     "daemonSocketPath": ""
+   }
+   ```
+
+   Leave `daemonSocketPath` empty to use the default
+   `$CODEX_HOME/app-server-control/app-server-control.sock`, or set it
+   explicitly if your daemon listens elsewhere. Restart the bridge to
+   pick up the new mode.
+
+4. Attach a TUI session as a peer client (optional but recommended):
+
+   ```bash
+   codex --remote unix:///Users/YOUR_USERNAME/.codex/app-server-control/app-server-control.sock
+   ```
+
+   Inside the TUI, list and resume the bridge's thread (look for
+   `serviceName: "codex-telegram"` and the thread id stored in
+   `.state/session.txt`). From then on, messages typed in Telegram and
+   messages typed in the TUI both target the same in-memory Codex
+   instance.
+
+### Trade-offs
+
+- The daemon is `experimental` in upstream Codex. Pin a version and
+  re-test after upgrades.
+- The default unix socket is single-user (mode 0600). Don't expose
+  `ws://0.0.0.0:PORT` unless you also configure the matching
+  `--ws-auth` mode upstream.
+- Approval traffic still flows through the bridge's handler in
+  `codex-daemon-client.mjs`. Private-tools turns use `on-request` plus
+  the same writable-roots / dangerous-command / token-leak guards as the
+  spawn path. Read-only and group turns use `approvalPolicy: "never"`.
+- A `pgrep -P $(launchctl list | awk '/telegram-codex-bridge$/{print $1}')`
+  returning empty is the visible cue that daemon mode is really live —
+  in spawn mode the bridge would have a `codex app-server` child.
+- Rollback is one line: flip `codexMode` back to `"spawn"` in the
+  config and restart the bridge. The daemon LaunchAgent can be stopped
+  independently with `launchctl bootout`.
+
 ## Safety Notes
 
 - Never commit `.env`, `config.json`, session files, offsets, logs, downloaded images, or downloaded files.
