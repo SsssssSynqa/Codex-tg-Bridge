@@ -1,40 +1,12 @@
 import { spawn } from 'node:child_process';
-import path from 'node:path';
+import {
+  isDangerousCommand,
+  isPathWithinRoots,
+  isSafeInspectionCommand,
+  normalizeAllowedRoots,
+} from './command-policy.mjs';
 
 const READ_ONLY_SANDBOX = { type: 'readOnly', networkAccess: false };
-
-function normalizeAllowedRoots(roots, fallbackRoot) {
-  const values = Array.isArray(roots) && roots.length ? roots : [fallbackRoot];
-  return [...new Set(values.map((root) => path.resolve(root)))];
-}
-
-function isPathWithinRoots(filePath, roots, cwd) {
-  if (!filePath) return true;
-  const resolved = path.resolve(path.isAbsolute(filePath) ? filePath : path.join(cwd, filePath));
-  return roots.some((root) => resolved === root || resolved.startsWith(`${root}${path.sep}`));
-}
-
-function commandText(command) {
-  if (Array.isArray(command)) return command.join(' ');
-  return String(command || '');
-}
-
-function isDangerousCommand(command) {
-  const text = commandText(command);
-  return [
-    /\brm\s+[^;&|]*(-[^\s]*r|--recursive)\b/i,
-    /\bsudo\b/i,
-    /\bgit\s+(reset\s+--hard|clean\s+-f|checkout\s+--|push\s+--force)\b/i,
-    /\bchmod\s+[^;&|]*(-[^\s]*R|--recursive)\b/i,
-    /\bchown\s+[^;&|]*(-[^\s]*R|--recursive)\b/i,
-    /\bdd\s+[^;&|]*(if=|of=)/i,
-    /\bdiskutil\b/i,
-    /\bmkfs\b/i,
-    /\blaunchctl\s+(bootout|remove|unload)\b/i,
-    /\b(killall|pkill)\b/i,
-    /\b\d+:[A-Za-z0-9_-]{30,}\b/,
-  ].some((pattern) => pattern.test(text));
-}
 
 export class CodexAppClient {
   constructor({
@@ -48,6 +20,7 @@ export class CodexAppClient {
     toolWritableRoots = null,
     toolNetworkAccess = false,
     onReady,
+    onThreadChange,
     onSecurityEvent,
     log = () => {},
   }) {
@@ -61,20 +34,26 @@ export class CodexAppClient {
     this.toolWritableRoots = normalizeAllowedRoots(toolWritableRoots, workdir);
     this.toolNetworkAccess = toolNetworkAccess === true;
     this.onReady = onReady;
+    this.onThreadChange = onThreadChange;
     this.onSecurityEvent = onSecurityEvent;
     this.log = log;
     this.nextId = 1;
     this.pending = new Map();
     this.turnWaiters = new Map();
     this.turnChunks = new Map();
+    this._turnChunkCharsLimit = 1_000_000;
     this.turnModes = new Map();
     this.completedTurns = new Map();
+    this._completedTurnsLimit = 64;
     this.buffer = '';
     this.ready = false;
     this.closing = false;
     this.activeTurnMode = null;
     this.handshakeError = null;
     this.handshakePromise = null;
+    // Set when the persisted thread could not be resumed; only /new or
+    // /resume clears it.
+    this.resumeBlocked = null;
     this.spawnServer();
   }
 
@@ -148,7 +127,10 @@ export class CodexAppClient {
 
     if (message.method === 'item/agentMessage/delta') {
       const { turnId, delta } = message.params;
-      this.turnChunks.set(turnId, (this.turnChunks.get(turnId) || '') + delta);
+      const current = this.turnChunks.get(turnId) || '';
+      if (current.length < this._turnChunkCharsLimit) {
+        this.turnChunks.set(turnId, `${current}${String(delta || '')}`.slice(0, this._turnChunkCharsLimit));
+      }
       return;
     }
 
@@ -166,7 +148,12 @@ export class CodexAppClient {
         this.turnWaiters.delete(turn.id);
         waiter.resolve(result);
       } else {
+        // Cache a completion that arrived before ask() registered a waiter.
+        // FIFO-bounded so it cannot grow without limit.
         this.completedTurns.set(turn.id, result);
+        while (this.completedTurns.size > this._completedTurnsLimit) {
+          this.completedTurns.delete(this.completedTurns.keys().next().value);
+        }
       }
       return;
     }
@@ -243,9 +230,12 @@ export class CodexAppClient {
     const cwd = params.cwd || this.workdir;
     const networkRequested = Boolean(params.networkApprovalContext)
       || (Array.isArray(params.proposedNetworkPolicyAmendments) && params.proposedNetworkPolicyAmendments.length > 0);
+    // Being inside the writable roots is not a licence to run anything: only
+    // side-effect-free inspection commands are approved without a human.
     const allowed = canWrite
       && !networkRequested
       && !isDangerousCommand(command)
+      && isSafeInspectionCommand(command)
       && isPathWithinRoots(cwd, this.toolWritableRoots, this.workdir);
     this.logSecurityEvent('command-approval', { command, cwd, networkRequested }, allowed ? 'approved' : 'declined');
     return allowed;
@@ -255,10 +245,16 @@ export class CodexAppClient {
     const grantRoot = params.grantRoot || null;
     const filePaths = params.fileChanges ? Object.keys(params.fileChanges) : [];
     const requestedPaths = [grantRoot, ...filePaths].filter(Boolean);
-    const allowed = canWrite
-      && requestedPaths.every((filePath) => isPathWithinRoots(filePath, this.toolWritableRoots, this.workdir));
-    this.logSecurityEvent('file-change-approval', { grantRoot, filePaths }, allowed ? 'approved' : 'declined');
-    return allowed;
+    // The stdio path has no asynchronous approval channel back to the owner,
+    // so it can never confirm a write. Declining is the honest answer; daemon
+    // mode is what forwards these to Telegram.
+    this.logSecurityEvent('file-change-approval', {
+      grantRoot,
+      filePaths,
+      canWrite,
+      requestedPaths,
+    }, 'declined-manual-confirmation-required');
+    return false;
   }
 
   logSecurityEvent(kind, params, decision) {
@@ -270,14 +266,23 @@ export class CodexAppClient {
     }
   }
 
-  send(method, params) {
+  send(method, params, timeoutMs = this.timeoutMs) {
     if (!this.child?.stdin?.writable) {
       return Promise.reject(new Error('Codex app-server stdin is not writable'));
     }
 
     const id = this.nextId++;
     const response = new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      // Without a timeout, a request the server never answers leaves this
+      // promise pending forever and wedges the caller's queue.
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`Codex RPC ${method} timeout`));
+      }, timeoutMs);
+      this.pending.set(id, {
+        resolve: (value) => { clearTimeout(timer); resolve(value); },
+        reject: (error) => { clearTimeout(timer); reject(error); },
+      });
     });
     this.child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
     return response;
@@ -296,29 +301,37 @@ export class CodexAppClient {
 
     if (this.threadId) {
       try {
-        const resumed = await this.send('thread/resume', {
-          threadId: this.threadId,
-          model: this.model,
-          serviceTier: this.serviceTier,
-          cwd: this.workdir,
-          approvalPolicy: 'never',
-          sandbox: 'read-only',
-          excludeTurns: true,
-          persistExtendedHistory: false,
-        });
-        this.threadId = resumed.thread.id;
+        await this.resumeExistingThread(this.threadId);
       } catch (error) {
-        this.logSecurityEvent('thread-resume-failed', {
+        // Fail closed. Starting a replacement thread here would look like the
+        // bot suddenly forgot every previous conversation, and the old thread
+        // would be orphaned with no way back. Stay up but not ready so the
+        // owner can decide with /resume or /new.
+        this.resumeBlocked = error;
+        this.handshakeError = new Error(`locked thread could not be resumed: ${this.threadId}`);
+        this.logSecurityEvent('thread-resume-blocked', {
           threadId: this.threadId,
           error: error?.message || String(error),
-        }, 'start-new-thread');
-        await this.startThread();
+        }, 'fail-closed');
+        if (this.onThreadChange) {
+          try {
+            this.onThreadChange({
+              previousThreadId: this.threadId,
+              reason: 'resume-failed',
+              blocked: true,
+              error: error?.message || String(error),
+            });
+          } catch {}
+        }
+        return;
       }
     } else {
       await this.startThread();
     }
 
     this.ready = true;
+    this.resumeBlocked = null;
+    this.handshakeError = null;
     if (this.onReady) this.onReady(this.threadId);
   }
 
@@ -351,6 +364,9 @@ export class CodexAppClient {
       excludeTurns: true,
       persistExtendedHistory: false,
     });
+    if (resumed?.thread?.id !== threadId) {
+      throw new Error(`thread/resume returned a different thread: expected=${threadId} actual=${resumed?.thread?.id || 'missing'}`);
+    }
     this.threadId = resumed.thread.id;
     return this.threadId;
   }
@@ -395,6 +411,7 @@ export class CodexAppClient {
       input,
       cwd: options.cwd || this.workdir,
       effort: this.effort,
+      ...(options.outputSchema ? { outputSchema: options.outputSchema } : {}),
       ...this.buildTurnOverrides(mode),
     });
     const turnId = started.turn.id;
@@ -412,6 +429,10 @@ export class CodexAppClient {
     const result = await new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.turnWaiters.delete(turnId);
+        this.turnModes.delete(turnId);
+        this.turnChunks.delete(turnId);
+        if (this.activeTurnMode?.turnId === turnId) this.activeTurnMode = null;
+        this.send('turn/interrupt', { threadId: this.threadId, turnId }, 5000).catch(() => {});
         reject(new Error('Codex response timed out'));
       }, this.timeoutMs);
       this.turnWaiters.set(turnId, {
@@ -436,16 +457,24 @@ export class CodexAppClient {
     return { reply: result.reply, threadId: this.threadId };
   }
 
+  // /new and /resume must still work while the client is fail-closed after a
+  // failed resume — they are how the owner recovers from it.
   async newThread() {
-    await this.waitReady();
+    if (!this.ready && !(this.child?.stdin?.writable && this.resumeBlocked)) await this.waitReady();
     await this.startThread();
+    this.ready = true;
+    this.resumeBlocked = null;
+    this.handshakeError = null;
     if (this.onReady) this.onReady(this.threadId);
     return this.threadId;
   }
 
   async resumeThread(threadId) {
-    await this.waitReady();
+    if (!this.ready && !(this.child?.stdin?.writable && this.resumeBlocked)) await this.waitReady();
     await this.resumeExistingThread(threadId);
+    this.ready = true;
+    this.resumeBlocked = null;
+    this.handshakeError = null;
     if (this.onReady) this.onReady(this.threadId);
     return this.threadId;
   }
@@ -455,6 +484,10 @@ export class CodexAppClient {
     this.pending.clear();
     for (const waiter of this.turnWaiters.values()) waiter.reject(error);
     this.turnWaiters.clear();
+    this.turnChunks.clear();
+    this.turnModes.clear();
+    this.completedTurns.clear();
+    this.activeTurnMode = null;
   }
 
   close() {

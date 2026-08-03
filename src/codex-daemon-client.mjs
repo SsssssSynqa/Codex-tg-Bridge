@@ -36,30 +36,42 @@
 //   - completedTurns caches turn/completed notifications that arrive before
 //     the corresponding ask() registers a waiter. Bounded by a FIFO limit so
 //     broadcast-driven completions from other clients do not accumulate.
-//   - modeForRequest distinguishes three cases:
+//   - modeForRequest distinguishes two cases:
 //       1. params.turnId is known to this client -> use that turn's mode.
-//       2. params.turnId is unknown to this client -> conservative read-only
-//          (this is some other client's turn; do not lend our private-tools
-//          authority to answer their approval).
-//       3. No params.turnId -> fall back to pendingTurnMode (set immediately
-//          before turn/start) and then activeTurnMode, to cover server
-//          requests that race the turn/start response.
-//   - thread/resume failure falls back to thread/start plus a short dummy turn
-//     so the rollout file exists on disk and other clients can attach. The
-//     onThreadChange callback fires before the swap so the bridge can save the
-//     previous thread id (e.g. to session.previous.txt) for recovery.
+//       2. params.turnId is unknown, or absent entirely -> 'external-turn'.
+//          The request belongs to another client (typically a `codex --remote`
+//          TUI on the same thread), or ownership cannot be proven. Either way
+//          this client neither lends its private-tools authority nor answers
+//          on the other client's behalf.
+//   - thread/resume failure is fail-closed: the client stays connected but not
+//     ready, and never silently starts a replacement thread. A new thread would
+//     read as amnesia to whoever is chatting. onThreadChange fires with
+//     blocked: true so the bridge can tell the owner to run /resume or /new.
 //
 // Security
 //   - The default daemon socket lives at $CODEX_HOME/app-server-control/
 //     app-server-control.sock with mode 0600. Only the user that started the
 //     daemon can connect.
-//   - The bridge's existing respondToServerRequest / approval handlers are
-//     reused verbatim so the writable-root / dangerous-command / token-leak
-//     defenses still apply.
+//   - Approvals are sorted into auto-approve (side-effect-free inspection
+//     commands inside the writable roots), auto-decline (dangerous commands,
+//     read-only turns, malformed payloads) and forward-to-owner (everything
+//     else, including every file write and every external-turn request).
+//     Without a requestUserApproval callback the forward bucket is declined,
+//     so an unconfigured bridge fails closed rather than open.
 
 import net from 'node:net';
 import crypto from 'node:crypto';
-import path from 'node:path';
+import {
+  extractWriteTargets,
+  isDangerousCommand,
+  isPathWithinRoots,
+  isSafeInspectionCommand,
+  normalizeAllowedRoots,
+} from './command-policy.mjs';
+
+// Re-exported so the smoke tests can exercise the exact predicates this client
+// uses without importing bridge.mjs (which would start the Telegram poll loop).
+export { extractWriteTargets, isDangerousCommand, isSafeInspectionCommand };
 
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 const READ_ONLY_SANDBOX = { type: 'readOnly', networkAccess: false };
@@ -124,37 +136,6 @@ function decodeFrames(buf) {
   return { frames, rest: buf.subarray(i) };
 }
 
-// Shared with codex-client.mjs: dangerous command list and path containment.
-function commandText(command) {
-  if (Array.isArray(command)) return command.join(' ');
-  return String(command || '');
-}
-function isDangerousCommand(command) {
-  const text = commandText(command);
-  return [
-    /\brm\s+[^;&|]*(-[^\s]*r|--recursive)\b/i,
-    /\bsudo\b/i,
-    /\bgit\s+(reset\s+--hard|clean\s+-f|checkout\s+--|push\s+--force)\b/i,
-    /\bchmod\s+[^;&|]*(-[^\s]*R|--recursive)\b/i,
-    /\bchown\s+[^;&|]*(-[^\s]*R|--recursive)\b/i,
-    /\bdd\s+[^;&|]*(if=|of=)/i,
-    /\bdiskutil\b/i,
-    /\bmkfs\b/i,
-    /\blaunchctl\s+(bootout|remove|unload)\b/i,
-    /\b(killall|pkill)\b/i,
-    /\b\d+:[A-Za-z0-9_-]{30,}\b/,
-  ].some((pattern) => pattern.test(text));
-}
-function normalizeAllowedRoots(roots, fallbackRoot) {
-  const values = Array.isArray(roots) && roots.length ? roots : [fallbackRoot];
-  return [...new Set(values.map((root) => path.resolve(root)))];
-}
-function isPathWithinRoots(filePath, roots, cwd) {
-  if (!filePath) return true;
-  const resolved = path.resolve(path.isAbsolute(filePath) ? filePath : path.join(cwd, filePath));
-  return roots.some((root) => resolved === root || resolved.startsWith(`${root}${path.sep}`));
-}
-
 export class CodexDaemonClient {
   constructor({
     socketPath,
@@ -169,6 +150,14 @@ export class CodexDaemonClient {
     onReady,
     onThreadChange,
     onSecurityEvent,
+    // Called for approvals that are neither clearly safe nor clearly dangerous.
+    // The bridge forwards them to the owner (Telegram inline keyboard) and
+    // resolves with 'accept' or 'decline'. When it is not supplied, those
+    // requests are declined instead of being silently approved.
+    requestUserApproval = null,
+    // Called when the daemon socket drops, so the bridge can invalidate any
+    // approval cards still waiting for a tap.
+    onDisconnect = null,
     log = console.log,
   }) {
     this.socketPath = socketPath;
@@ -183,6 +172,8 @@ export class CodexDaemonClient {
     this.onReady = onReady;
     this.onThreadChange = onThreadChange;
     this.onSecurityEvent = onSecurityEvent;
+    this.requestUserApproval = requestUserApproval;
+    this.onDisconnect = onDisconnect;
     this.log = log;
 
     this.socket = null;
@@ -194,12 +185,19 @@ export class CodexDaemonClient {
     this.completedTurns = new Map();
     this._completedTurnsLimit = 64;
     this.turnChunks = new Map();
+    // Streaming deltas are broadcast to every attached client, including turns
+    // started by a TUI. Bound both the per-turn text and the number of tracked
+    // turns so a long terminal session cannot grow this map without limit.
+    this._turnChunkCharsLimit = 1_000_000;
+    this._turnChunkEntriesLimit = 128;
     this.turnModes = new Map();
     this.activeTurnMode = null;
-    this.pendingTurnMode = null;
     this.ready = false;
     this.closing = false;
     this.handshakeError = null;
+    // Set when the locked thread could not be resumed. The client stays
+    // connected but refuses to serve turns until the owner runs /resume or /new.
+    this.resumeBlocked = null;
     this.connecting = null;
 
     // Wait-capable handshake promise so ask() can block on recovery.
@@ -240,6 +238,17 @@ export class CodexDaemonClient {
       this.upgraded = false;
       const key = crypto.randomBytes(16).toString('base64');
       const expectedAccept = makeAccept(key);
+      // A daemon that accepts the TCP/unix connection but never answers the
+      // upgrade would otherwise hang this promise forever and stall every turn.
+      const handshakeTimer = setTimeout(() => {
+        if (this.upgraded) return;
+        try { this.socket?.destroy(); } catch {}
+        reject(new Error('Codex daemon WebSocket handshake timeout'));
+      }, 10000);
+      const rejectHandshake = (error) => {
+        clearTimeout(handshakeTimer);
+        reject(error);
+      };
 
       this.socket.once('connect', () => {
         const handshake = [
@@ -255,7 +264,7 @@ export class CodexDaemonClient {
       });
 
       this.socket.on('error', (err) => {
-        if (!this.upgraded) reject(err);
+        if (!this.upgraded) rejectHandshake(err);
         else this.failAll(err);
       });
 
@@ -263,6 +272,7 @@ export class CodexDaemonClient {
         const wasUpgraded = this.upgraded;
         this.ready = false;
         this.upgraded = false;
+        if (!wasUpgraded) rejectHandshake(new Error('Codex daemon socket closed during handshake'));
         this.failAll(new Error('Codex daemon socket closed'));
         if (wasUpgraded && !this.closing) {
           this.log('Codex daemon disconnected; reconnecting in 2s');
@@ -283,11 +293,14 @@ export class CodexDaemonClient {
           const head = this.buf.subarray(0, headEnd).toString('utf8');
           this.buf = this.buf.subarray(headEnd + 4);
           if (!head.includes('101 Switching Protocols')) {
-            return reject(new Error(`WS handshake failed: ${head.slice(0, 200)}`));
+            try { this.socket?.destroy(); } catch {}
+            return rejectHandshake(new Error(`WS handshake failed: ${head.slice(0, 200)}`));
           }
           if (!head.toLowerCase().includes(`sec-websocket-accept: ${expectedAccept.toLowerCase()}`)) {
-            return reject(new Error('WS handshake accept key mismatch'));
+            try { this.socket?.destroy(); } catch {}
+            return rejectHandshake(new Error('WS handshake accept key mismatch'));
           }
+          clearTimeout(handshakeTimer);
           this.upgraded = true;
           resolve();
         }
@@ -326,7 +339,7 @@ export class CodexDaemonClient {
     // Notification (server push).
     if (message.method === 'item/agentMessage/delta') {
       const { turnId, delta } = message.params || {};
-      this.turnChunks.set(turnId, (this.turnChunks.get(turnId) || '') + delta);
+      this.appendTurnDelta(turnId, delta);
       return;
     }
 
@@ -360,15 +373,187 @@ export class CodexDaemonClient {
     // The bridge can opt out of noisy ones via capabilities.optOutNotificationMethods.
   }
 
-  // Mirrors the server-request handling in codex-client.mjs so the same
-  // path/command/file-change guard rails apply in daemon mode.
-  respondToServerRequest(message) {
-    try {
-      const result = this.handleServerRequest(message.method, message.params || {});
-      this.sendResponse(message.id, result);
-    } catch (error) {
-      this.sendResponse(message.id, null, { code: -32601, message: error.message || 'rejected' });
+  appendTurnDelta(turnId, delta) {
+    if (!turnId) return;
+    if (!this.turnChunks.has(turnId) && this.turnChunks.size >= this._turnChunkEntriesLimit) {
+      const evictable = [...this.turnChunks.keys()].find(
+        (candidate) => !this.turnModes.has(candidate) && !this.turnWaiters.has(candidate),
+      );
+      if (evictable) this.turnChunks.delete(evictable);
+      if (this.turnChunks.size >= this._turnChunkEntriesLimit) return;
     }
+    const current = this.turnChunks.get(turnId) || '';
+    if (current.length >= this._turnChunkCharsLimit) return;
+    this.turnChunks.set(turnId, `${current}${String(delta || '')}`.slice(0, this._turnChunkCharsLimit));
+  }
+
+  // Approval requests are sorted into three buckets:
+  //   1. Clearly safe   -> auto-approve. Only side-effect-free inspection
+  //      commands inside the writable roots qualify.
+  //   2. Clearly unsafe -> auto-decline (dangerous command, read-only turn,
+  //      malformed file-change payload).
+  //   3. Everything else -> forward to the owner and wait for a decision.
+  // Any other server-originated method keeps the synchronous fallback path.
+  respondToServerRequest(message) {
+    const method = message.method;
+    const params = message.params || {};
+    const isCmdApproval = method === 'item/commandExecution/requestApproval' || method === 'execCommandApproval';
+    const isFileApproval = method === 'item/fileChange/requestApproval' || method === 'applyPatchApproval';
+
+    if (!isCmdApproval && !isFileApproval) {
+      try {
+        const result = this.handleServerRequest(method, params);
+        this.sendResponse(message.id, result);
+      } catch (error) {
+        this.sendResponse(message.id, null, { code: -32601, message: error.message || 'rejected' });
+      }
+      return;
+    }
+
+    const mode = this.modeForRequest(params);
+    const canWrite = mode === 'private-tools';
+    // Two protocol generations: new methods use accept/decline, the legacy
+    // ones use approved/denied.
+    const isNewProto = method === 'item/commandExecution/requestApproval' || method === 'item/fileChange/requestApproval';
+    const acceptValue = isNewProto ? 'accept' : 'approved';
+    const declineValue = isNewProto ? 'decline' : 'denied';
+
+    let verdict = this.classifyApproval(method, params, canWrite, isCmdApproval);
+    // An external turn is one this client did not start — typically a
+    // `codex --remote` TUI attached to the same thread. The bridge is not the
+    // decision maker there: declining on the human's behalf silently breaks
+    // their own terminal session. Dangerous or malformed requests are still
+    // refused; anything else is forwarded so the owner decides, and it is
+    // never auto-approved even when every target sits inside the writable
+    // roots. Group turns do not reach this branch: their turnId is known and
+    // stays hard read-only.
+    if (mode === 'external-turn' && verdict.kind === 'auto-decline' && verdict.reason === 'read-only-mode') {
+      const recheck = this.classifyApproval(method, params, true, isCmdApproval);
+      if (recheck.kind === 'auto-decline') {
+        verdict = recheck;
+      } else {
+        const lp = recheck.logParams || {};
+        verdict = {
+          kind: 'forward',
+          reason: 'external-client-turn',
+          logParams: lp,
+          summary: recheck.summary || (isCmdApproval
+            ? {
+              command: lp.command,
+              cwd: lp.cwd,
+              networkRequested: lp.networkRequested,
+              targetsOutsideRoots: lp.targetsOutsideRoots || [],
+            }
+            : { grantRoot: lp.grantRoot, filePaths: lp.filePaths }),
+        };
+      }
+    }
+    const securityKind = isCmdApproval ? 'command-approval' : 'file-change-approval';
+
+    if (verdict.kind === 'auto-approve') {
+      this.logSecurityEvent(securityKind, verdict.logParams, 'approved');
+      this.sendResponse(message.id, { decision: acceptValue });
+      return;
+    }
+    if (verdict.kind === 'auto-decline') {
+      this.logSecurityEvent(securityKind, verdict.logParams, `declined-${verdict.reason}`);
+      this.sendResponse(message.id, { decision: declineValue });
+      return;
+    }
+
+    // verdict.kind === 'forward'
+    if (!this.requestUserApproval) {
+      this.logSecurityEvent(securityKind, verdict.logParams, 'declined-no-callback');
+      this.sendResponse(message.id, { decision: declineValue });
+      return;
+    }
+
+    this.logSecurityEvent(securityKind, verdict.logParams, 'forward-to-owner');
+    Promise.resolve(this.requestUserApproval({
+      method,
+      params,
+      isNewProto,
+      reason: verdict.reason,
+      summary: verdict.summary,
+    })).then((userSemantic) => {
+      // userSemantic is 'accept' or 'decline'. acceptForSession stays in the
+      // wire map so a future UI can offer it without touching this client, but
+      // no button currently returns it.
+      const wireMap = isNewProto
+        ? { accept: 'accept', acceptForSession: 'acceptForSession', decline: 'decline' }
+        : { accept: 'approved', acceptForSession: 'approved_for_session', decline: 'denied' };
+      const decision = wireMap[userSemantic] || declineValue;
+      this.logSecurityEvent(securityKind, { ...verdict.logParams, userSemantic }, `user-${userSemantic}`);
+      this.sendResponse(message.id, { decision });
+    }).catch((error) => {
+      this.logSecurityEvent(securityKind, { ...verdict.logParams, error: error.message }, 'forward-error-declined');
+      this.sendResponse(message.id, { decision: declineValue });
+    });
+  }
+
+  classifyApproval(method, params, canWrite, isCmdApproval) {
+    if (isCmdApproval) {
+      const command = params.command
+        || (Array.isArray(params.commandActions) ? params.commandActions.map((a) => a.cmd).join(' && ') : '')
+        || '';
+      const cwd = params.cwd || this.workdir;
+      const networkRequested = Boolean(params.networkApprovalContext)
+        || (Array.isArray(params.proposedNetworkPolicyAmendments) && params.proposedNetworkPolicyAmendments.length > 0);
+      const logParams = { command, cwd, networkRequested };
+
+      if (isDangerousCommand(command)) {
+        return { kind: 'auto-decline', reason: 'dangerous-command', logParams };
+      }
+      if (!canWrite) {
+        return { kind: 'auto-decline', reason: 'read-only-mode', logParams };
+      }
+      // A safe cwd is not enough: the command string itself can redirect or
+      // copy outside the roots (`> file`, cp/mv/tee/dd of=, curl -o, ...).
+      const writeTargets = extractWriteTargets(command);
+      const targetsOutsideRoots = writeTargets.filter((t) => !isPathWithinRoots(t, this.toolWritableRoots, cwd));
+      const cwdInsideRoots = isPathWithinRoots(cwd, this.toolWritableRoots, this.workdir);
+      if (
+        !networkRequested
+        && targetsOutsideRoots.length === 0
+        && cwdInsideRoots
+        && isSafeInspectionCommand(command)
+      ) {
+        return { kind: 'auto-approve', logParams: { ...logParams, writeTargets } };
+      }
+      return {
+        kind: 'forward',
+        reason: networkRequested
+          ? 'network-requested'
+          : (targetsOutsideRoots.length
+            ? 'command-writes-outside-roots'
+            : (cwdInsideRoots ? 'manual-confirmation-required' : 'cwd-outside-roots')),
+        logParams: { ...logParams, writeTargets, targetsOutsideRoots },
+        summary: { command, cwd, networkRequested, targetsOutsideRoots },
+      };
+    }
+
+    // File-change approval.
+    const grantRoot = params.grantRoot || null;
+    const filePaths = params.fileChanges ? Object.keys(params.fileChanges) : [];
+    const logParams = { grantRoot, filePaths };
+
+    if (!canWrite) {
+      return { kind: 'auto-decline', reason: 'read-only-mode', logParams };
+    }
+    const allPaths = [grantRoot, ...filePaths].filter(Boolean);
+    // A malformed payload with no paths at all gives the owner nothing to
+    // judge, so it is declined rather than forwarded as a blank card.
+    if (allPaths.length === 0) {
+      return { kind: 'auto-decline', reason: 'malformed-empty-paths', logParams };
+    }
+    const allInRoots = allPaths.every((p) => isPathWithinRoots(p, this.toolWritableRoots, this.workdir));
+    // File writes are never silent, not even inside the writable roots.
+    return {
+      kind: 'forward',
+      reason: allInRoots ? 'manual-confirmation-required' : 'paths-outside-roots',
+      logParams,
+      summary: { grantRoot, filePaths },
+    };
   }
 
   sendResponse(id, result, error) {
@@ -414,19 +599,18 @@ export class CodexDaemonClient {
 
   // Mode lookup for a server-originated request.
   //   - Known turnId -> that turn's mode.
-  //   - Unknown turnId -> conservative read-only. The request belongs to
-  //     another client (e.g. a TUI attached to the same thread); do not lend
-  //     this client's private-tools authority to it.
-  //   - No turnId -> fall back to pendingTurnMode (set just before
-  //     turn/start) then activeTurnMode. This covers the short race where a
-  //     server request arrives before the turn/start response.
+  //   - Unknown turnId -> 'external-turn'. The request belongs to another
+  //     client (e.g. a TUI attached to the same thread). Never lend this
+  //     client's private-tools authority to it, and never answer for it.
+  //   - No turnId -> also 'external-turn'. In a shared daemon, ownership
+  //     cannot be proven without one, so requiring an explicit owner decision
+  //     is safer than inheriting whatever the bridge is currently running.
   modeForRequest(params) {
     if (params?.turnId) {
       if (this.turnModes.has(params.turnId)) return this.turnModes.get(params.turnId);
-      return 'read-only';
+      return 'external-turn';
     }
-    if (this.pendingTurnMode) return this.pendingTurnMode;
-    return this.activeTurnMode?.mode || 'read-only';
+    return 'external-turn';
   }
 
   shouldApproveCommand(params, canWrite) {
@@ -437,6 +621,7 @@ export class CodexDaemonClient {
     const allowed = canWrite
       && !networkRequested
       && !isDangerousCommand(command)
+      && isSafeInspectionCommand(command)
       && isPathWithinRoots(cwd, this.toolWritableRoots, this.workdir);
     this.logSecurityEvent('command-approval', { command, cwd, networkRequested }, allowed ? 'approved' : 'declined');
     return allowed;
@@ -446,9 +631,15 @@ export class CodexDaemonClient {
     const grantRoot = params.grantRoot || null;
     const filePaths = params.fileChanges ? Object.keys(params.fileChanges) : [];
     const requestedPaths = [grantRoot, ...filePaths].filter(Boolean);
-    const allowed = canWrite && requestedPaths.every((fp) => isPathWithinRoots(fp, this.toolWritableRoots, this.workdir));
-    this.logSecurityEvent('file-change-approval', { grantRoot, filePaths }, allowed ? 'approved' : 'declined');
-    return allowed;
+    // Daemon mode forwards file changes to the owner. This synchronous
+    // fallback exists only for callers without an approval channel, and it
+    // must never approve a write just because the path is in-root.
+    this.logSecurityEvent(
+      'file-change-approval',
+      { grantRoot, filePaths, canWrite, requestedPaths },
+      'declined-manual-confirmation-required',
+    );
+    return false;
   }
 
   logSecurityEvent(kind, params, decision) {
@@ -483,7 +674,7 @@ export class CodexDaemonClient {
 
   async handshake() {
     await this.call('initialize', {
-      clientInfo: { name: 'codex-telegram-bridge', version: '0.3.0-daemon' },
+      clientInfo: { name: 'codex-telegram-bridge', version: '0.4.0-daemon' },
       capabilities: null,
     });
     this.notify('initialized', {});
@@ -493,21 +684,28 @@ export class CodexDaemonClient {
       try {
         await this.resumeExistingThread(this.threadId);
       } catch (error) {
-        this.log(`thread/resume(${originalThreadId}) failed: ${error.message}; falling back to startThread + dummy turn`);
-        this.logSecurityEvent('thread-resume-fallback', {
+        // Session continuity is a hard invariant: one bot, one history. Never
+        // replace the persisted thread just because resume failed — a silent
+        // new thread looks like amnesia to whoever is chatting. Stay connected
+        // but degraded so the owner can run /resume or /new deliberately.
+        this.resumeBlocked = error;
+        this.handshakeError = new Error(`locked thread could not be resumed: ${originalThreadId}`);
+        this.log(`thread/resume(${originalThreadId}) failed: fail-closed, no replacement thread created`);
+        this.logSecurityEvent('thread-resume-blocked', {
           previous_thread_id: originalThreadId,
           error: error?.message || String(error),
-        }, 'fallback-with-dummy-turn');
+        }, 'fail-closed');
         if (this.onThreadChange) {
-          try { this.onThreadChange({ previousThreadId: originalThreadId, reason: 'resume-failed' }); } catch {}
+          try {
+            this.onThreadChange({
+              previousThreadId: originalThreadId,
+              reason: 'resume-failed',
+              blocked: true,
+              error: error?.message || String(error),
+            });
+          } catch {}
         }
-        await this.startThread();
-        try {
-          await this.dummyTurn();
-          this.log('Dummy turn completed; rollout flushed and other clients can attach.');
-        } catch (e) {
-          this.log(`Dummy turn failed (non-fatal): ${e.message}`);
-        }
+        return;
       }
     } else {
       await this.startThread();
@@ -515,6 +713,7 @@ export class CodexDaemonClient {
     }
 
     this.ready = true;
+    this.resumeBlocked = null;
     this.handshakeError = null;
     if (this.onReady) this.onReady(this.threadId);
   }
@@ -545,12 +744,16 @@ export class CodexDaemonClient {
       sandbox: 'read-only',
       persistExtendedHistory: false,
     });
+    if (resumed?.thread?.id !== threadId) {
+      throw new Error(`thread/resume returned a different thread: expected=${threadId} actual=${resumed?.thread?.id || 'missing'}`);
+    }
     this.threadId = resumed.thread.id;
     return this.threadId;
   }
 
-  // Send a minimal initialization turn so the rollout JSONL is created on
-  // disk and other clients (e.g. `codex --remote`) can resume the thread.
+  // Send a minimal initialization turn so the rollout JSONL is created on disk
+  // and other clients (e.g. `codex --remote`) can resume the thread. Only ever
+  // called for a freshly started thread, never after a failed resume.
   async dummyTurn() {
     const started = await this.call('turn/start', {
       threadId: this.threadId,
@@ -619,25 +822,18 @@ export class CodexDaemonClient {
 
     const mode = options.toolMode || 'read-only';
 
-    // Pre-set pendingTurnMode so an approval request that races the
-    // turn/start response sees the correct mode.
-    this.pendingTurnMode = mode;
-    let started;
-    try {
-      const input = [
-        { type: 'text', text, text_elements: [] },
-        ...images.map((image) => ({ type: 'localImage', path: image.path })),
-      ];
-      started = await this.call('turn/start', {
-        threadId: this.threadId,
-        input,
-        cwd: options.cwd || this.workdir,
-        effort: this.effort,
-        ...this.buildTurnOverrides(mode),
-      });
-    } finally {
-      this.pendingTurnMode = null;
-    }
+    const input = [
+      { type: 'text', text, text_elements: [] },
+      ...images.map((image) => ({ type: 'localImage', path: image.path })),
+    ];
+    const started = await this.call('turn/start', {
+      threadId: this.threadId,
+      input,
+      cwd: options.cwd || this.workdir,
+      effort: this.effort,
+      ...(options.outputSchema ? { outputSchema: options.outputSchema } : {}),
+      ...this.buildTurnOverrides(mode),
+    });
 
     const turnId = started.turn.id;
     this.turnModes.set(turnId, mode);
@@ -654,6 +850,12 @@ export class CodexDaemonClient {
     const result = await new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.turnWaiters.delete(turnId);
+        this.turnModes.delete(turnId);
+        this.turnChunks.delete(turnId);
+        if (this.activeTurnMode?.turnId === turnId) this.activeTurnMode = null;
+        // Tell the daemon to stop; otherwise the abandoned turn keeps running
+        // and its approval requests would arrive with no owner.
+        this.call('turn/interrupt', { threadId: this.threadId, turnId }, 5000).catch(() => {});
         reject(new Error('Codex turn timeout'));
       }, this.timeoutMs);
       this.turnWaiters.set(turnId, {
@@ -672,16 +874,26 @@ export class CodexDaemonClient {
     return { reply: result.reply, threadId: this.threadId };
   }
 
+  // /new and /resume are the two commands that are allowed to run while the
+  // client is fail-closed on a resume failure — they are exactly how the owner
+  // gets out of that state, so they must not wait on a handshake that will
+  // never report ready.
   async newThread() {
-    await this.waitReady();
+    if (!this.ready && !(this.upgraded && this.resumeBlocked)) await this.waitReady();
     await this.startThread();
+    this.ready = true;
+    this.resumeBlocked = null;
+    this.handshakeError = null;
     if (this.onReady) this.onReady(this.threadId);
     return this.threadId;
   }
 
   async resumeThread(threadId) {
-    await this.waitReady();
+    if (!this.ready && !(this.upgraded && this.resumeBlocked)) await this.waitReady();
     await this.resumeExistingThread(threadId);
+    this.ready = true;
+    this.resumeBlocked = null;
+    this.handshakeError = null;
     if (this.onReady) this.onReady(this.threadId);
     return this.threadId;
   }
@@ -691,6 +903,19 @@ export class CodexDaemonClient {
     this.pending.clear();
     for (const waiter of this.turnWaiters.values()) waiter.reject(error);
     this.turnWaiters.clear();
+    this.turnChunks.clear();
+    this.turnModes.clear();
+    this.completedTurns.clear();
+    this.activeTurnMode = null;
+    // Let the bridge invalidate approval cards still waiting for a tap: the
+    // daemon is gone, so a late tap would try to answer a dead connection.
+    if (typeof this.onDisconnect === 'function') {
+      try {
+        this.onDisconnect(error?.message || 'daemon-disconnect');
+      } catch (e) {
+        try { this.log(`onDisconnect callback threw: ${e.message}`); } catch {}
+      }
+    }
   }
 
   close() {

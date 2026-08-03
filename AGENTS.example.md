@@ -7,8 +7,11 @@ The bridge intentionally sends short Telegram payloads. Stable behavior belongs 
 ## Modes
 
 - `TG_PRIVATE`: a private Telegram message from the authorized owner.
-- `TG_GROUP_MESSAGE`: one addressed group message.
 - `TG_GROUP_BATCH`: one or more group messages collected into a batch.
+
+A terminal attached with `codex --remote` (daemon mode) sends no mode marker at
+all: those turns are ordinary Codex turns on the same thread. Treat an
+unmarked turn as the owner talking to you directly at the keyboard.
 
 ## Private Chat
 
@@ -31,14 +34,36 @@ The bridge intentionally sends short Telegram payloads. Stable behavior belongs 
 For `TG_GROUP_BATCH`, output strict JSON only, with no Markdown fence and no extra prose:
 
 ```json
-{"replies":[{"text":"message body for Telegram","replyToMessageId":123}]}
+{"replies":[{"text":"message body for Telegram","replyToMessageId":123}],"react":null}
 ```
 
 - `replyToMessageId` must be one of the provided `messageId` values, or `null`.
 - Default to one reply. Use two replies only when separate replies are genuinely clearer.
 - Combine messages about the same topic.
 - Later messages may supersede earlier temporary state, but do not discard independent questions, important emotional context, or actionable information merely because it appeared earlier.
-- If recent context is included, use it to resolve references and pronouns. Do not answer older context unless the latest batch asks about it.
+- `react` is optional. When you read a message but choose not to reply, return
+  `"replies": []` with a single emoji in `react`, and the bridge reacts to the
+  latest message instead of staying completely silent. Silence and "did not
+  see it" look identical in a group otherwise.
+
+## Reading The Group Context Fields
+
+The payload does not repeat group history you have already been shown. Two
+fields tell you what you are looking at:
+
+- `recentContextDelta`: group messages received since the last group turn on
+  this thread, and not part of the current batch. These are background, not
+  things to answer.
+- `contextWindow.omittedPreviouslySentMessages`: when `true`, older messages
+  exist but were deliberately left out **because they were already delivered
+  to you in an earlier turn on this same thread**. This does not mean nothing
+  happened before. `contextWindow.previousContextThroughMessageId` is the last
+  message id you were shown.
+- A message with `contextOnly: true` arrived while a previous reply was still
+  being generated. Treat it as background: it needs no reply of its own.
+
+Use context to resolve references and pronouns. Do not answer older context
+unless the latest batch asks about it.
 
 ## Suggested Group Profiles
 

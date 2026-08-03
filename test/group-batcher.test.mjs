@@ -63,3 +63,16 @@ test('per-chat timing override can hold a first message for a larger batch', asy
   await sleep(80);
   assert.deepEqual(batches, [['A', 'B']]);
 });
+
+test('malformed model output is never published to a group', () => {
+  // The group protocol is a security boundary: raw model output must not be
+  // forwarded to a chat just because the JSON envelope failed to parse.
+  assert.deepEqual(parseBatchReplies('private raw model output', [1]), []);
+  assert.deepEqual(parseBatchReplies('{"replies": "not an array"}', [1]), []);
+});
+
+test('an emoji reaction rides along with an empty reply set', () => {
+  const replies = parseBatchReplies('{"replies":[],"react":"👀"}', [1]);
+  assert.deepEqual([...replies], []);
+  assert.equal(replies._react, '👀');
+});
