@@ -23,7 +23,7 @@ Telegram Codex Bridge 让你用一个 Telegram 机器人作为常驻 Codex 会�
 ## 快速开始
 
 ```bash
-git clone https://github.com/SsssssSynqa/Codex-tg-Bridge.git
+git clone https://github.com/HailSyner/Codex-tg-Bridge.git
 cd Codex-tg-Bridge
 cp .env.example .env
 cp config.example.json config.json

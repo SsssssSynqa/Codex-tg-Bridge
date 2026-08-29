@@ -23,7 +23,7 @@ Telegram Codex Bridge lets you run a Telegram bot as a lightweight front end for
 ## Quick Start
 
 ```bash
-git clone https://github.com/SsssssSynqa/Codex-tg-Bridge.git
+git clone https://github.com/HailSyner/Codex-tg-Bridge.git
 cd Codex-tg-Bridge
 cp .env.example .env
 cp config.example.json config.json
