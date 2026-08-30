@@ -83,5 +83,7 @@
   "updateMaxAttempts": 12,
   "updateRetryBaseMs": 3000,
   "updateRetryMaxMs": 300000,
-  "updateJournalCompactBytes": 8388608
+  "updateJournalCompactBytes": 8388608,
+  "albumWindowMs": 1200,
+  "pollStallMs": 90000
 }

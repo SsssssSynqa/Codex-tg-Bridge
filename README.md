@@ -292,6 +292,50 @@ Re-sending the same recent messages on every mention wastes tokens and makes the
 
 Cursors live in `.state/group-context-cursors.json` (0600, atomic write).
 
+## Photo Albums
+
+A Telegram "album" is not one message. Selecting three photos and sending them
+once produces **three separate updates**, each carrying one photo, related only
+by a shared `media_group_id`. A bridge that feeds each update as it arrives
+answers three times — once per photo.
+
+There is no "this album has N items" field and no end marker, so the only
+workable approach is to hold a short silence window per `media_group_id`:
+
+- every update still lands in the durable inbox on its own, so crash safety is
+  unchanged — merging happens at dispatch time, not at receive time;
+- if the window has not closed, that round is skipped and a timer is set. The
+  poll is never slept on: it may be parked on a 30s long-poll at that moment;
+- the whole album is handled by its lowest `update_id`; the others are marked
+  done alongside it, so nothing is fed twice or left in pending;
+- one failed photo download is logged and the rest of the reply still goes out;
+- the same `media_group_id` seen in another chat or forum topic is never merged.
+
+`albumWindowMs` (default 1200) tunes the window; `0` disables aggregation.
+
+## Surviving a Flaky Network
+
+Two failures that look like the model's fault but are not:
+
+**A single timed-out send used to cost a whole turn.** The reply was already
+generated, one `sendMessage` timed out, and the turn was marked failed — nothing
+reached Telegram while the text sat in the terminal. Transport-level faults
+(`fetch failed`, aborts, resets, 5xx) are now retried with backoff. Real
+Telegram answers — `chat not found`, malformed requests, 429 — are **not**
+retried: they must surface, not be papered over.
+
+**A bridge can stay alive while going deaf.** After an aborted request, undici's
+keep-alive pool can leave a socket that neither returns, rejects, nor aborts, so
+`getUpdates` hangs forever. The process is up, the logs are clean, and a
+supervisor that only watches for exits sees nothing wrong — messages simply stop
+arriving. A watchdog now guards **only** the `getUpdates` leg and exits so the
+supervisor can restart a bridge that can actually hear.
+
+The watchdog deliberately stays quiet between `endPoll()` and the next
+`beginPoll()`: reply generation runs in the same loop and can legitimately take
+minutes. Killing the bridge while someone is waiting for an answer is worse than
+being deaf for a moment. `pollStallMs` defaults to 90000.
+
 ## Reliable Delivery
 
 Every inbound update is fsync'd to a journal **before** the Telegram poll offset advances, so a crash replays instead of dropping messages.

@@ -34,6 +34,10 @@ import {
   parseBatchReplies,
 } from './group-batcher.mjs';
 import { SendRateLimiter } from './rate-limit.mjs';
+import { withTransportRetry } from './telegram-transport-retry.mjs';
+import { createPollStallWatchdog, DEFAULT_STALL_MS } from './poll-stall-watchdog.mjs';
+import { createAlbumBatcher, DEFAULT_ALBUM_WINDOW_MS } from './telegram-album-batcher.mjs';
+import { sendWithMissingReplyFallback } from './telegram-reply-fallback.mjs';
 import { redactSensitiveText } from './redact.mjs';
 import {
   buildMessageTextWithAttachments,
@@ -562,21 +566,47 @@ const codex = checkOnly ? null : makeCodexClient();
 // Telegram I/O
 // ---------------------------------------------------------------------------
 
-async function telegram(method, params = {}) {
-  const response = await fetch(`${telegramApi}/${method}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(params),
-    signal: AbortSignal.timeout(40000),
+// Transport-level retry plus reply-target fallback.
+//
+// One timed-out send used to cost a whole turn: the model had already produced
+// the reply, the send failed once, and the entire turn was marked failed — the
+// user saw nothing while the text sat in the terminal. The network under these
+// bridges fails in bursts, so a single attempt is not a fair test of it.
+//
+// onAttempt fires before every attempt so the poll-stall watchdog can reset its
+// clock: a legitimate retry chain runs for seconds, a dead socket does not.
+async function telegram(method, params = {}, { onAttempt = null } = {}) {
+  return withTransportRetry((attempt) => {
+    if (typeof onAttempt === 'function') onAttempt(attempt);
+    return sendWithMissingReplyFallback(async (requestParams) => {
+      const response = await fetch(`${telegramApi}/${method}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(requestParams),
+        signal: AbortSignal.timeout(40000),
+      });
+      const data = await response.json();
+
+      if (!response.ok || !data.ok) {
+        const description = String(data.description || response.statusText || 'unknown error');
+        const error = new Error(`Telegram ${method} failed: ${description}`);
+        // The fallback needs these to tell "reply target is gone" apart from
+        // every other 400: without them a deleted quoted message would keep
+        // failing forever instead of being re-sent without the quote.
+        error.status = response.status;
+        error.telegramDescription = description;
+        throw error;
+      }
+
+      return data.result;
+    }, params, {
+      onFallback: () => log(`Telegram ${method}: reply target is gone, resending without reply_parameters`),
+    });
+  }, {
+    onRetry: ({ attempt, maxAttempts, delayMs, error }) => {
+      log(`Telegram ${method} transport fault ${attempt}/${maxAttempts}, retrying in ${delayMs}ms: ${error.message}`);
+    },
   });
-  const data = await response.json();
-
-  if (!response.ok || !data.ok) {
-    const description = String(data.description || response.statusText || 'unknown error');
-    throw new Error(`Telegram ${method} failed: ${description}`);
-  }
-
-  return data.result;
 }
 
 function splitTelegramText(text, limit = 4000) {
@@ -1568,7 +1598,7 @@ async function processPrivateMessage(message, text, context, images = [], files 
 // Routing
 // ---------------------------------------------------------------------------
 
-async function handleMessage(message, durableUpdateId = null) {
+async function handleMessage(message, durableUpdateId = null, albumMessages = []) {
   const rawText = getTelegramMessageText(message);
   const messageHasAttachments = hasTelegramAttachments(message);
   if (!message || (!rawText && !messageHasAttachments)) return {};
@@ -1704,7 +1734,7 @@ async function handleMessage(message, durableUpdateId = null) {
     ? new RegExp(`@${botUsername.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'gi')
     : null;
   const captionOrText = (mentionPattern ? rawText.replace(mentionPattern, '') : rawText).trim();
-  const { images, files, notes: attachmentNotes } = await downloadTelegramAttachments(message, {
+  const attachmentOptions = {
     token,
     imageCacheDir,
     fileCacheDir,
@@ -1712,7 +1742,22 @@ async function handleMessage(message, durableUpdateId = null) {
     maxImageBytes: Number(config.imageMaxBytes || DEFAULT_CONFIG.imageMaxBytes),
     maxFileBytes: Number(config.fileMaxBytes || DEFAULT_CONFIG.fileMaxBytes),
     maxPreviewChars: Number(config.attachmentTextMaxChars || DEFAULT_CONFIG.attachmentTextMaxChars),
-  });
+  };
+  const { images, files, notes: attachmentNotes } = await downloadTelegramAttachments(message, attachmentOptions);
+  // The rest of an album carries only photos (the caption rides on the first
+  // message), so their attachments join this same turn: three photos sent at
+  // once become one question and one answer, not three of each.
+  for (const extra of albumMessages) {
+    try {
+      const more = await downloadTelegramAttachments(extra, attachmentOptions);
+      images.push(...more.images);
+      files.push(...more.files);
+      if (Array.isArray(more.notes) && Array.isArray(attachmentNotes)) attachmentNotes.push(...more.notes);
+    } catch (error) {
+      // Losing one photo of an album must not take the whole reply down with it.
+      log(`album attachment download failed message=${extra?.message_id}: ${error.message}`);
+    }
+  }
   const text = buildMessageTextWithAttachments(captionOrText, images, files, attachmentNotes);
   if (!text && !images.length && !files.length) {
     if (isGroup && shouldRememberCurrentGroupMessage) {
@@ -1806,11 +1851,13 @@ async function checkConnection() {
 // Durable dispatch
 // ---------------------------------------------------------------------------
 
-async function prepareTelegramUpdate(update) {
+async function prepareTelegramUpdate(update, albumMessages = []) {
   if (update.callback_query) {
     return { completion: handleCallbackQuery(update.callback_query) };
   }
-  if (update.message) return (await handleMessage(update.message, Number(update.update_id))) || {};
+  if (update.message) {
+    return (await handleMessage(update.message, Number(update.update_id), albumMessages)) || {};
+  }
   return {};
 }
 
@@ -1962,13 +2009,61 @@ async function replayPendingDurableGroupBatches() {
   }
 }
 
+// A Telegram "album" is not one message: it is N updates that only share a
+// media_group_id. Without aggregation the bot answers once per photo.
+// albumWindowMs: 0 disables it and restores the previous per-message behaviour.
+const albumWindowMs = config.albumWindowMs === undefined
+  ? DEFAULT_ALBUM_WINDOW_MS
+  : Math.max(0, Number(config.albumWindowMs) || 0);
+const albumBatcher = albumWindowMs > 0 ? createAlbumBatcher({ windowMs: albumWindowMs }) : null;
+let albumFlushTimer = null;
+// Someone has to come back when the window closes: the poll may be parked on a
+// 30s long-poll, so waiting for it to return is not good enough.
+function scheduleAlbumFlush(waitMs) {
+  if (albumFlushTimer) return;
+  albumFlushTimer = setTimeout(() => {
+    albumFlushTimer = null;
+    dispatchDurableUpdates().catch((error) => log(`album flush dispatch failed: ${error.message}`));
+  }, Math.max(50, Number(waitMs) || 50));
+  albumFlushTimer.unref?.();
+}
+
 async function runDurableDispatch() {
   await replayPendingDurableGroupBatches();
   const maxInFlight = Math.max(1, Number(config.updateMaxInFlight || DEFAULT_CONFIG.updateMaxInFlight));
-  for (const update of durableInbox.pendingUpdates()) {
+  const pendingSnapshot = [...durableInbox.pendingUpdates()];
+  for (const update of pendingSnapshot) {
     const updateId = Number(update.update_id);
     if (inFlightUpdates.has(updateId)) continue;
     if (inFlightUpdates.size >= maxInFlight) break;
+
+    // Album aggregation. Every update still lands in the durable inbox on its
+    // own — merging happens here, not at receive time, so crash safety is
+    // untouched. If the window has not closed yet, skip this round and set a
+    // timer instead of sleeping on the receive path.
+    let albumMessages = [];
+    let albumSiblingIds = [];
+    let albumId = null;
+    if (albumBatcher) {
+      const plan = albumBatcher.plan(update, pendingSnapshot);
+      if (plan.action === 'wait') {
+        scheduleAlbumFlush(plan.waitMs);
+        continue;
+      }
+      if (plan.action === 'merge') {
+        const [main, ...rest] = plan.updates;
+        // The whole album is handled by its lowest update_id; the rest are
+        // marked done alongside it, so they are never fed twice and never
+        // linger in pending.
+        if (Number(main.update_id) !== updateId) continue;
+        albumMessages = rest.map((sibling) => sibling.message).filter(Boolean);
+        albumSiblingIds = rest.map((sibling) => Number(sibling.update_id));
+        albumId = plan.albumId;
+        if (albumMessages.length) {
+          log(`album merged chat=${update.message?.chat?.id} album=${albumId} items=${albumMessages.length + 1}`);
+        }
+      }
+    }
 
     let prepared;
     try {
@@ -1976,7 +2071,7 @@ async function runDurableDispatch() {
       // download and enqueue happen in update_id order. The long-running
       // model/send work is represented by `completion`, so later updates can
       // still join the same group batch.
-      prepared = await prepareTelegramUpdate(update);
+      prepared = await prepareTelegramUpdate(update, albumMessages);
     } catch (error) {
       recordUpdateFailure(update, error, 'prepare');
       break;
@@ -1986,6 +2081,8 @@ async function runDurableDispatch() {
     const tracked = completion
       .then(() => {
         durableInbox.markDone(updateId);
+        for (const siblingId of albumSiblingIds) durableInbox.markDone(siblingId);
+        if (albumId) albumBatcher?.forget(albumId);
       })
       .catch((error) => {
         recordUpdateFailure(update, error, 'completion');
@@ -2059,13 +2156,28 @@ async function poll() {
   durableRetryTimer.unref();
   await dispatchDurableUpdates();
 
+  // Only the getUpdates leg is watched. Reply generation runs in this same
+  // loop and can legitimately take minutes, so the watchdog must stay quiet
+  // between endPoll() and the next beginPoll() — killing the bridge while the
+  // user is waiting for an answer is worse than being deaf for a moment.
+  const pollWatchdog = createPollStallWatchdog({
+    stallMs: Number(config.pollStallMs) || DEFAULT_STALL_MS,
+    onStall: (stuckMs) => {
+      log(`poll stalled: getUpdates hung ${Math.round(stuckMs / 1000)}s with no return and no abort;`
+        + ' exiting so the supervisor restarts a bridge that can actually hear');
+      process.exit(1);
+    },
+  });
+  pollWatchdog.start();
+
   for (;;) {
     try {
       const updates = await telegram('getUpdates', {
         offset: updateOffset,
         timeout: 30,
         allowed_updates: ['message', 'callback_query'],
-      });
+      }, { onAttempt: () => pollWatchdog.beginPoll() });
+      pollWatchdog.endPoll();
 
       for (const update of updates) {
         // Durable acceptance has to happen before the Telegram offset moves:
@@ -2076,6 +2188,7 @@ async function poll() {
       }
       await dispatchDurableUpdates();
     } catch (error) {
+      pollWatchdog.endPoll();
       log(`poll failed; retrying in 3s: ${error.message}`);
       await new Promise((resolve) => setTimeout(resolve, 3000));
     }
